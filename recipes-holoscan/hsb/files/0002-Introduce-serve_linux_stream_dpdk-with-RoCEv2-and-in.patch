@@ -1,0 +1,2472 @@
+From 66839062c4b54cbb9acd09cb5d69fd4e01fa2e00 Mon Sep 17 00:00:00 2001
+From: Sachin Saxena <sachin.saxena@nxp.com>
+Date: Wed, 4 Mar 2026 14:39:22 +0530
+Subject: [PATCH 2/2] Introduce serve_linux_stream_dpdk with RoCEv2 and
+ integrate DPDK for I/O
+
+    - Adds new serve_linux_stream_dpdk application
+    - Implemented DPDK-based fast data-path for packet handling
+    - Updated build and integration hooks for the new DPDK app
+    - Removed CUDA emulation requirement from the build path
+    - Attach cacheable camera buffers as rte_mbuf external buffers
+    - Update TX fast-path to use zero-copy
+    - TX/RX checksum offload
+    - Introduce -DENABLE_ROCEV2=OFF option in cmake. TBD
+    - ISI read uses FRAME & LINE Ready Status to avoid corruption.
+    - User can control CPU cores to be use for control and data path
+
+Signed-off-by: Gagandeep Singh <g.singh@nxp.com>
+Signed-off-by: Sachin Saxena <sachin.saxena@nxp.com>
+Upstream-Status: Inappropriate [i.MX95 board BSP specific]
+---
+ CMakeLists.txt                                |  13 +
+ src/hololink/CMakeLists.txt                   |   3 +
+ src/hololink/core/CMakeLists.txt              |   4 +
+ src/hololink/emulation/CMakeLists.txt         |  60 +-
+ src/hololink/emulation/base_transmitter.hpp   |   9 +-
+ src/hololink/emulation/data_plane.cpp         |  22 +
+ src/hololink/emulation/data_plane.hpp         |   6 +
+ .../emulation/examples/CMakeLists.txt         | 138 ++-
+ .../emulation/examples/emulator_utils.hpp     |   3 +
+ .../emulation/examples/emulator_utils_cpu.cpp | 313 +++++++
+ .../emulation/examples/serve_linux_file.cpp   |   2 +
+ .../examples/serve_linux_stream_dpdk.cpp      | 884 ++++++++++++++++++
+ src/hololink/emulation/linux_transmitter.cpp  | 430 ++++++++-
+ src/hololink/emulation/linux_transmitter.hpp  |   6 +
+ src/hololink/emulation/mem_register.cpp       |   3 +-
+ src/hololink/emulation/sensors/CMakeLists.txt |  10 +-
+ 16 files changed, 1853 insertions(+), 53 deletions(-)
+ create mode 100644 src/hololink/emulation/examples/emulator_utils_cpu.cpp
+ create mode 100644 src/hololink/emulation/examples/serve_linux_stream_dpdk.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index f95e951..a49b056 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1,5 +1,6 @@
+ # SPDX-FileCopyrightText: Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ # SPDX-License-Identifier: Apache-2.0
++# Copyright 2026 NXP
+ #
+ # Licensed under the Apache License, Version 2.0 (the "License");
+ # you may not use this file except in compliance with the License.
+@@ -25,6 +26,13 @@ option(HOLOLINK_BUILD_ARGUS_ISP "Build Argus ISP support" OFF)
+ option(HOLOLINK_BUILD_SIPL "Build NvSIPL capture components" OFF)
+ option(HOLOLINK_BUILD_EMULATOR "Build HSB Emulator components" ON)
+ option(HOLOLINK_BUILD_FUSA "Build NvFusa capture components" OFF)
++option(HOLOLINK_USE_DPDK "Enable building with DPDK (libdpdk) support" ON)
++option(ENABLE_ROCEV2 "Enable RoCEv2 packet splitting mode" OFF)
++
++set(HOLOLINK_COMPILE_DEFINITIONS "")
++if(ENABLE_ROCEV2)
++    message(STATUS "RoCEv2 mode TBD")
++endif()
+ 
+ if (HOLOLINK_BUILD_PYTHON AND NOT HOLOLINK_BUILD_EMULATOR)
+   message(FATAL_ERROR "If building Python bindings, HOLOLINK_BUILD_EMULATOR must be ON")
+@@ -71,6 +79,11 @@ if(NOT CMAKE_INSTALL_INCLUDEDIR)
+   set(CMAKE_INSTALL_INCLUDEDIR include)
+ endif()
+ 
++# Make variable available to subdirectories
++set(HOLOLINK_COMPILE_DEFINITIONS ${HOLOLINK_COMPILE_DEFINITIONS} PARENT_SCOPE)
++# Also apply locally
++add_compile_definitions(${HOLOLINK_COMPILE_DEFINITIONS})
++
+ # Add subdirectories based on the build options
+ add_subdirectory(src)
+ if(HOLOLINK_BUILD_TOOLS)
+diff --git a/src/hololink/CMakeLists.txt b/src/hololink/CMakeLists.txt
+index d38cb5d..7234c46 100644
+--- a/src/hololink/CMakeLists.txt
++++ b/src/hololink/CMakeLists.txt
+@@ -1,5 +1,6 @@
+ # SPDX-FileCopyrightText: Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ # SPDX-License-Identifier: Apache-2.0
++# Copyright 2026 NXP
+ #
+ # Licensed under the Apache License, Version 2.0 (the "License");
+ # you may not use this file except in compliance with the License.
+@@ -19,5 +20,7 @@ if (NOT HOLOLINK_BUILD_ONLY_NATIVE)
+ add_subdirectory(common)
+ add_subdirectory(expr_eval)
+ add_subdirectory(operators)
++endif()
++if (HOLOLINK_BUILD_EMULATOR)
+ add_subdirectory(emulation)
+ endif()
+diff --git a/src/hololink/core/CMakeLists.txt b/src/hololink/core/CMakeLists.txt
+index 434ff04..1480d73 100644
+--- a/src/hololink/core/CMakeLists.txt
++++ b/src/hololink/core/CMakeLists.txt
+@@ -1,5 +1,6 @@
+ # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ # SPDX-License-Identifier: Apache-2.0
++# Copyright 2026 NXP
+ #
+ # Licensed under the Apache License, Version 2.0 (the "License");
+ # you may not use this file except in compliance with the License.
+@@ -13,6 +14,8 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
++set(THREADS_PREFER_PTHREAD_FLAG ON)
++find_package(Threads REQUIRED)
+ add_library(hololink_core STATIC
+   arp_wrapper.cpp
+   data_channel.cpp
+@@ -37,6 +40,7 @@ target_link_libraries(hololink_core
+     fmt::fmt-header-only
+ )
+ 
++target_link_libraries(hololink_core PUBLIC Threads::Threads)
+ target_include_directories(hololink_core
+   PUBLIC
+     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../..>
+diff --git a/src/hololink/emulation/CMakeLists.txt b/src/hololink/emulation/CMakeLists.txt
+index ce744ad..b3a6aa8 100644
+--- a/src/hololink/emulation/CMakeLists.txt
++++ b/src/hololink/emulation/CMakeLists.txt
+@@ -1,5 +1,6 @@
+ # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ # SPDX-License-Identifier: Apache-2.0
++# Copyright 2026 NXP
+ #
+ # Licensed under the Apache License, Version 2.0 (the "License");
+ # you may not use this file except in compliance with the License.
+@@ -17,9 +18,27 @@ cmake_minimum_required(VERSION 3.17)
+ 
+ option(HSB_EMULATOR_BUILD_PYTHON "When building standalone HSB Emulator, including building the python environment." ON)
+ set(HSB_EMULATOR_PYTHON_VENV "env" CACHE STRING "relative path (from build directory) to the standalone HSB Emulator's Python virtual environment")
+-
++add_link_options(-static-libstdc++ -static-libgcc)
+ ##### Emulation target handling
+ 
++set(USE_CUDA OFF)
++if (CUDAToolkit_FOUND AND NOT HOLOLINK_BUILD_ONLY_NATIVE)
++  set(USE_CUDA ON)
++endif()
++
++if (HOLOLINK_USE_DPDK)
++	# Make pkg-config return static link info
++	set(PKG_CONFIG_USE_STATIC_LIBS ON)
++
++	find_package(PkgConfig REQUIRED)
++	pkg_check_modules(DPDK REQUIRED IMPORTED_TARGET libdpdk)
++
++	# Optional: quick debug
++	message(STATUS "DPDK version via pkg-config: ${DPDK_VERSION}")
++	message(STATUS "DPDK static libs: ${DPDK_STATIC_LIBRARIES}")
++	message(STATUS "DPDK static ldflags: ${DPDK_STATIC_LDFLAGS}")
++endif()
++
+ add_library(emulation STATIC
+     base_transmitter.cpp
+     data_plane.cpp
+@@ -61,6 +80,11 @@ target_include_directories(emulation
+         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/hololink/emulation>
+ )
++if (HOLOLINK_USE_DPDK)
++	target_link_options(emulation PRIVATE -Wl,--whole-archive)
++	target_link_libraries(emulation PUBLIC PkgConfig::DPDK)
++	target_link_options(emulation PRIVATE -Wl,--no-whole-archive)
++endif()
+ target_link_libraries(emulation 
+     PUBLIC
+         dlpack::dlpack
+@@ -92,7 +116,7 @@ set(EMULATION_INCLUDES
+ find_package(ZLIB)
+ find_package(CUDAToolkit)
+ 
+-if (CUDAToolkit_FOUND)
++if (USE_CUDA)
+     add_library(emulationcoe STATIC
+         coe_data_plane.cpp
+         coe_transmitter.cpp
+@@ -105,10 +129,10 @@ if (CUDAToolkit_FOUND)
+             $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+             $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/hololink/emulation>
+     )
+-    target_link_libraries(emulationcoe 
++    target_link_libraries(emulationcoe
+         PUBLIC
+-            hololink::emulation 
+-            CUDA::cudart 
++            hololink::emulation
++	    CUDA::cudart
+     )
+     set_property(TARGET emulationcoe PROPERTY POSITION_INDEPENDENT_CODE ON)
+ 
+@@ -123,8 +147,9 @@ if (CUDAToolkit_FOUND)
+         DESTINATION ${CMAKE_INSTALL_LIBDIR}
+         COMPONENT hololink-emulation
+     )
++endif()
+ 
+-    if (ZLIB_FOUND)
++   if (ZLIB_FOUND)
+         add_library(emulationroce STATIC
+             linux_data_plane.cpp
+             linux_transmitter.cpp
+@@ -137,13 +162,22 @@ if (CUDAToolkit_FOUND)
+                 $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+                 $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/hololink/emulation>
+         )
+-        target_link_libraries(emulationroce 
+-            PUBLIC 
+-                hololink::emulation 
+-                ${ZLIB_LIBRARIES} 
+-                CUDA::cudart 
++	target_compile_definitions(emulationroce PUBLIC USE_CUDA=0)
++
++if (HOLOLINK_USE_DPDK)
++	target_link_options(emulationroce PRIVATE -Wl,--whole-archive)
++	target_link_libraries(emulationroce PUBLIC PkgConfig::DPDK)
++	target_link_options(emulationroce PRIVATE -Wl,--no-whole-archive)
++	target_link_libraries(emulationroce PUBLIC ZLIB::ZLIB hololink::emulation)
++else()
++        target_link_libraries(emulationroce
++            PUBLIC
++                hololink::emulation
++	        ${ZLIB_LIBRARIES}
++		CUDA::cudart
+         )
+-        set_property(TARGET emulationroce PROPERTY POSITION_INDEPENDENT_CODE ON)
++endif()
++	set_property(TARGET emulationroce PROPERTY POSITION_INDEPENDENT_CODE ON)
+ 
+         add_library(hololink::emulation::roce ALIAS emulationroce)
+ 
+@@ -156,8 +190,6 @@ if (CUDAToolkit_FOUND)
+             EXPORT HololinkTargets
+             DESTINATION ${CMAKE_INSTALL_LIBDIR}
+             COMPONENT hololink-emulation)
+-    endif()
+-
+ endif()
+ 
+ add_subdirectory(sensors)
+diff --git a/src/hololink/emulation/base_transmitter.hpp b/src/hololink/emulation/base_transmitter.hpp
+index df499a5..ab058d8 100644
+--- a/src/hololink/emulation/base_transmitter.hpp
++++ b/src/hololink/emulation/base_transmitter.hpp
+@@ -1,6 +1,7 @@
+ /**
+  * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+  * SPDX-License-Identifier: Apache-2.0
++ * Copyright 2026 NXP
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -22,6 +23,8 @@
+ 
+ #include <cstdint>
+ 
++#include <rte_mbuf.h>
++
+ #include "dlpack/dlpack.h"
+ #include "hololink/core/serializer.hpp"
+ 
+@@ -94,8 +97,12 @@ public:
+      * propagated to other objects to satisfy the DLPack Python API specification.
+      */
+     virtual int64_t send(const TransmissionMetadata* metadata, const DLTensor& tensor) = 0;
++    virtual int64_t send_dpdk(const TransmissionMetadata* metadata, const DLTensor& tensor,
++		    struct rte_mempool *mbuf_pool, uint16_t portid,
++		    rte_mbuf_extbuf_free_callback_t  ext_buf_free_callback_fn,
++		    uint16_t line_no, uint8_t is_last, phys_addr_t buf_paddr) = 0;
+ };
+ 
+ } // namespace hololink::emulation
+ 
+-#endif // BASE_TRANSMITTER_HPP
+\ No newline at end of file
++#endif // BASE_TRANSMITTER_HPP
+diff --git a/src/hololink/emulation/data_plane.cpp b/src/hololink/emulation/data_plane.cpp
+index 21f3460..d2d2647 100644
+--- a/src/hololink/emulation/data_plane.cpp
++++ b/src/hololink/emulation/data_plane.cpp
+@@ -1,6 +1,7 @@
+ /**
+  * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+  * SPDX-License-Identifier: Apache-2.0
++ * Copyright 2026 NXP
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -220,6 +221,27 @@ int64_t DataPlane::send(const DLTensor& tensor)
+     return n_bytes;
+ }
+ 
++int64_t DataPlane::send_dpdk(const DLTensor& tensor,
++		struct rte_mempool *mbuf_pool, uint16_t portid,
++		rte_mbuf_extbuf_free_callback_t  ext_buf_free_callback_fn,
++		uint16_t line_no, uint8_t is_last, phys_addr_t buf_paddr)
++{
++    if (!transmitter_) {
++        fprintf(stderr, "DataPlane::send() no transmitter\n");
++        return -1;
++    }
++
++    std::scoped_lock<std::mutex> lock(metadata_mutex_); // locks metadata for the duration of the send
++    update_metadata(); // call the abstract method under the protection of the lock. Transmitter is assured to have synchronized access to the metadata
++    int64_t n_bytes = transmitter_->send_dpdk(metadata_, tensor, mbuf_pool,
++		    portid, ext_buf_free_callback_fn, line_no, is_last, buf_paddr);
++    if (n_bytes < 0) {
++        fprintf(stderr, "DataPlane::send() error sending tensor\n");
++    }
++    return n_bytes;
++}
++
++
+ // helper function to get the delta in seconds between two timespecs and writing to BootpPacket::secs (delta time must fit in 16 bits)
+ // the timespecs are assumed to be from CLOCK_MONOTONIC
+ static inline uint16_t get_delta_secs(const struct timespec& start_time, const struct timespec& end_time)
+diff --git a/src/hololink/emulation/data_plane.hpp b/src/hololink/emulation/data_plane.hpp
+index aeda263..0c07537 100644
+--- a/src/hololink/emulation/data_plane.hpp
++++ b/src/hololink/emulation/data_plane.hpp
+@@ -1,6 +1,7 @@
+ /**
+  * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+  * SPDX-License-Identifier: Apache-2.0
++ * Copyright 2026 NXP
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -29,6 +30,8 @@
+ #include <thread>
+ #include <unistd.h>
+ 
++#include <rte_mbuf.h>
++
+ #include "dlpack/dlpack.h"
+ 
+ #include "hololink/core/data_channel.hpp"
+@@ -98,6 +101,9 @@ public:
+      * @note This method is synchronous. It will block and metadata will be protected by a mutex until the send is complete.
+      */
+     int64_t send(const DLTensor& tensor);
++    int64_t send_dpdk(const DLTensor& tensor, struct rte_mempool *mbuf_pool,
++		    uint16_t portid, rte_mbuf_extbuf_free_callback_t  ext_buf_free_callback_fn,
++		    uint16_t line_no, uint8_t is_last, phys_addr_t buf_paddr);
+ 
+     /**
+      * @brief Get the sensor ID associated with the DataPlane.
+diff --git a/src/hololink/emulation/examples/CMakeLists.txt b/src/hololink/emulation/examples/CMakeLists.txt
+index 960a926..41cfaad 100644
+--- a/src/hololink/emulation/examples/CMakeLists.txt
++++ b/src/hololink/emulation/examples/CMakeLists.txt
+@@ -1,5 +1,6 @@
+ # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ # SPDX-License-Identifier: Apache-2.0
++# Copyright 2026 NXP
+ #
+ # Licensed under the Apache License, Version 2.0 (the "License");
+ # you may not use this file except in compliance with the License.
+@@ -14,26 +15,56 @@
+ # limitations under the License.
+ 
+ # Create emulator_utils library for common functionality
+-add_library(emulator_utils STATIC
+-    emulator_utils.cu
+-)
+ 
+-target_include_directories(emulator_utils PUBLIC
+-    ${CMAKE_CURRENT_SOURCE_DIR}
+-    ${CMAKE_CURRENT_SOURCE_DIR}/../../..
+-    ${CMAKE_CURRENT_SOURCE_DIR}/../sensors
+-    ${CUDAToolkit_INCLUDE_DIRS}
+-    ${DLPACK_PATH}
+-)
+-target_link_libraries(emulator_utils PUBLIC
+-    hololink::emulation
+-    hololink::emulation::sensors)
++# Decide whether to use the CUDA version of emulator_utils
++# Use CUDA only when toolkit is found AND you are not in native-only mode
++set(USE_CUDA OFF)
++if (CUDAToolkit_FOUND AND NOT HOLOLINK_BUILD_ONLY_NATIVE)
++  set(USE_CUDA ON)
++endif()
++
++
++find_package(Threads REQUIRED)
++# Build emulator_utils from .cu or .cpp depending on USE_CUDA_EMULATOR_UTILS
++if (USE_CUDA)
++    add_library(emulator_utils STATIC
++        emulator_utils.cu
++    )
++    target_compile_definitions(emulator_utils PUBLIC HOLOLINK_USE_CUDA=1)
++    target_link_libraries(emulator_utils PUBLIC
++        hololink::emulation
++        hololink::emulation::sensors
++        CUDA::cudart
++    )
++    target_include_directories(emulator_utils PUBLIC
++        ${CMAKE_CURRENT_SOURCE_DIR}
++        ${CMAKE_CURRENT_SOURCE_DIR}/../../..
++        ${CMAKE_CURRENT_SOURCE_DIR}/../sensors
++        ${CUDAToolkit_INCLUDE_DIRS}
++        ${DLPACK_PATH}
++    )
++    target_compile_definitions(emulator_utils PUBLIC USE_CUDA_EMULATOR_UTILS=0)
++else()
++    add_library(emulator_utils STATIC
++        emulator_utils_cpu.cpp
++    )
++    target_compile_definitions(emulator_utils PUBLIC HOLOLINK_USE_CUDA=0)
++    target_link_libraries(emulator_utils PUBLIC
++        hololink::emulation
++        hololink::emulation::sensors
++    )
++    target_include_directories(emulator_utils PUBLIC
++        ${CMAKE_CURRENT_SOURCE_DIR}
++        ${CMAKE_CURRENT_SOURCE_DIR}/../../..
++        ${CMAKE_CURRENT_SOURCE_DIR}/../sensors
++        ${DLPACK_PATH}
++    )
++endif()
+ 
+ set_property(TARGET emulator_utils PROPERTY POSITION_INDEPENDENT_CODE ON)
+ 
+ # Basic examples that only need HSBEmulator
+-if (CUDAToolkit_FOUND)
+-    # COE-based examples
++if (USE_CUDA)
+     add_executable(serve_coe_file
+         serve_coe_file.cpp
+     )
+@@ -46,9 +77,9 @@ if (CUDAToolkit_FOUND)
+     
+     target_link_libraries(serve_coe_file PRIVATE
+         hololink::emulation
+-        hololink::emulation::coe
++	hololink::emulation::coe
+         emulator_utils
+-        CUDA::cudart
++	CUDA::cudart
+     )
+ 
+     add_executable(serve_coe_vb1940_file
+@@ -63,13 +94,13 @@ if (CUDAToolkit_FOUND)
+     
+     target_link_libraries(serve_coe_vb1940_file PRIVATE
+         hololink::emulation
+-        hololink::emulation::coe
++	hololink::emulation::coe
+         hololink::emulation::sensors
+         emulator_utils
+-        CUDA::cudart
++	CUDA::cudart
+     )
+-    
+-    if (ZLIB_FOUND)
++endif()
++if (ZLIB_FOUND AND USE_CUDA AND NOT HOLOLINK_USE_DPDK)
+         # Linux-based examples
+         add_executable(serve_linux_file
+             serve_linux_file.cpp
+@@ -81,19 +112,74 @@ if (CUDAToolkit_FOUND)
+             ${ZLIB_INCLUDE_DIRS}
+             ${CUDAToolkit_INCLUDE_DIRS}
+         )
+-        
+         target_link_libraries(serve_linux_file PRIVATE
+             hololink::emulation
+-            hololink::emulation::roce
++	    hololink::emulation::roce
+             emulator_utils
+             ${ZLIB_LIBRARIES}
+-            CUDA::cudart
++	    CUDA::cudart
+         )
+-    endif()
+ endif()
++if (ZLIB_FOUND AND NOT USE_CUDA AND  HOLOLINK_USE_DPDK)
++	set(PKG_CONFIG_USE_STATIC_LIBS ON CACHE BOOL "Use static libs from pkg-config" FORCE)
++	find_package(PkgConfig REQUIRED)
++	pkg_check_modules(DPDK REQUIRED IMPORTED_TARGET libdpdk)
++
++
++        if (NOT DPDK_FOUND)
++            message(FATAL_ERROR
++                "DPDK requested (-DUSE_DPDK=ON) but libdpdk was not found via pkg-config.\n"
++                "Hints:\n"
++                "  - Ensure pkg-config for DPDK is installed (e.g., dpdk.pc present).\n"
++                "  - Export/adjust PKG_CONFIG_PATH to include the directory containing dpdk.pc.\n"
++                "  - Example: export PKG_CONFIG_PATH=/opt/dpdk/lib/pkgconfig:$PKG_CONFIG_PATH")
++        endif()
++
++	# Optional: quick debug
++	message(STATUS "DPDK version via pkg-config: ${DPDK_VERSION}")
++	message(STATUS "DPDK static libs: ${DPDK_STATIC_LIBRARIES}")
++	message(STATUS "DPDK static ldflags: ${DPDK_STATIC_LDFLAGS}")
++        # Linux-based examples
++        add_executable(serve_linux_file
++            serve_linux_file.cpp
++        )
++        set_target_properties(serve_linux_file PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/examples")
++
++        target_include_directories(serve_linux_file PRIVATE
++            ${CMAKE_CURRENT_SOURCE_DIR}/../../..
++            ${ZLIB_INCLUDE_DIRS}
++        )
++        target_link_libraries(serve_linux_file PRIVATE
++	   ${DPDK_STATIC_LDFLAGS}
++	   ${DPDK_STATIC_LIBRARIES}
++            hololink::emulation
++	    hololink::emulation::roce
++            emulator_utils
++            ${ZLIB_LIBRARIES}
++        )
++
++	add_executable(serve_linux_stream_dpdk
++            serve_linux_stream_dpdk.cpp
++        )
++        set_target_properties(serve_linux_stream_dpdk PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/examples")
++
++        target_include_directories(serve_linux_stream_dpdk PRIVATE
++            ${CMAKE_CURRENT_SOURCE_DIR}/../../..
++            ${ZLIB_INCLUDE_DIRS}
++        )
++        target_link_libraries(serve_linux_stream_dpdk PRIVATE
++	    ${DPDK_STATIC_LDFLAGS}
++	    ${DPDK_STATIC_LIBRARIES}
++	    Threads::Threads
++            hololink::emulation
++	    hololink::emulation::roce
++            emulator_utils
++            ${ZLIB_LIBRARIES}
++        )
++    endif()
+ 
+ # VB1940 sensor examples that need both emulation and sensor libraries
+-if (CUDAToolkit_FOUND)
++if (USE_CUDA)
+     # COE-based VB1940 examples
+     add_executable(serve_coe_single_vb1940_frames
+         serve_coe_single_vb1940_frames.cpp
+diff --git a/src/hololink/emulation/examples/emulator_utils.hpp b/src/hololink/emulation/examples/emulator_utils.hpp
+index 5f8a4ef..4b43bff 100644
+--- a/src/hololink/emulation/examples/emulator_utils.hpp
++++ b/src/hololink/emulation/examples/emulator_utils.hpp
+@@ -1,6 +1,7 @@
+ /**
+  * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+  * SPDX-License-Identifier: Apache-2.0
++ * Copyright 2026 NXP
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -22,7 +23,9 @@
+ 
+ #include <cassert>
+ #include <cstdint>
++#if USE_CUDA_EMULATOR_UTILS
+ #include <cuda_runtime.h>
++#endif
+ #include <inttypes.h>
+ #include <memory>
+ #include <string>
+diff --git a/src/hololink/emulation/examples/emulator_utils_cpu.cpp b/src/hololink/emulation/examples/emulator_utils_cpu.cpp
+new file mode 100644
+index 0000000..4640ae1
+--- /dev/null
++++ b/src/hololink/emulation/examples/emulator_utils_cpu.cpp
+@@ -0,0 +1,313 @@
++/**
++ * SPDX-License-Identifier: Apache-2.0
++ * Copyright 2026 NXP
++ */
++
++// emulator_utils_cpu.cpp
++#include <string>
++#include <cstring>   // std::memcpy
++#include <stdexcept>
++#include <cstdio>
++#include <fstream>
++#include <vector>
++#include <algorithm>
++
++#include "emulator_utils.hpp" // whatever header declares loop_single_from_file
++// If there isn't a header yet, forward-declare with the correct signature:
++
++struct LoopConfig;
++namespace hololink { namespace emulation {
++  class DataPlane;
++}}
++
++
++// ---------------------------
++// DLPack helpers (define once)
++// ---------------------------
++namespace {
++  static inline size_t tensor_num_elems(const DLTensor& t) {
++    size_t n = 1;
++    for (int i = 0; i < t.ndim; ++i) n *= static_cast<size_t>(t.shape[i]);
++    return n;
++  }
++  static inline size_t tensor_elem_bytes(const DLTensor& t) {
++    return static_cast<size_t>((t.dtype.bits * t.dtype.lanes + 7) / 8);
++  }
++  static inline size_t tensor_nbytes(const DLTensor& t) {
++    return tensor_num_elems(t) * tensor_elem_bytes(t);
++  }
++
++  template <typename T>
++  void fill_gradient(void* data, size_t num_elems, T start, T step) {
++    auto* p = static_cast<T*>(data);
++    for (size_t i = 0; i < num_elems; ++i) p[i] = static_cast<T>(start + step * static_cast<T>(i));
++  }
++
++  void fill_buffer_with_pattern(DLTensor& t, uint64_t seed) {
++    if (!t.data) return;
++    const size_t num_elems = tensor_num_elems(t);
++    const size_t elem_bytes = tensor_elem_bytes(t);
++
++    switch (t.dtype.code) {
++      case kDLUInt:
++      case kDLInt:
++        if (elem_bytes == 1) {
++          fill_gradient<uint8_t>(t.data, num_elems, static_cast<uint8_t>(seed & 0xFF), 1);
++        } else if (elem_bytes == 2) {
++          fill_gradient<uint16_t>(t.data, num_elems, static_cast<uint16_t>(seed & 0xFFFF), 257);
++        } else if (elem_bytes == 4) {
++          fill_gradient<uint32_t>(t.data, num_elems, static_cast<uint32_t>(seed), 0x01010101u);
++        } else if (elem_bytes == 8) {
++          fill_gradient<uint64_t>(t.data, num_elems, static_cast<uint64_t>(seed), 0x0101010101010101ULL);
++        } else {
++          std::memset(t.data, 0, tensor_nbytes(t));
++        }
++        break;
++
++      case kDLFloat:
++        if (elem_bytes == 4) {
++          float* p = static_cast<float*>(t.data);
++          const float base = static_cast<float>((seed % 256) / 255.0f);
++          for (size_t i = 0; i < num_elems; ++i) p[i] = base + 0.001f * static_cast<float>(i);
++        } else if (elem_bytes == 8) {
++          double* p = static_cast<double*>(t.data);
++          const double base = static_cast<double>((seed % 256) / 255.0);
++          for (size_t i = 0; i < num_elems; ++i) p[i] = base + 0.001 * static_cast<double>(i);
++        } else {
++          std::memset(t.data, 0, tensor_nbytes(t));
++        }
++        break;
++
++      default:
++        std::memset(t.data, 0, tensor_nbytes(t));
++        break;
++    }
++  }
++
++  // Try to read a raw frame from disk into the tensor buffer
++  bool read_file_into_tensor(const std::string& path, DLTensor& out) {
++    if (!out.data) return false;
++    std::ifstream f(path, std::ios::binary);
++    if (!f) return false;
++
++    f.seekg(0, std::ios::end);
++    const std::streamoff fsize = f.tellg();
++    f.seekg(0, std::ios::beg);
++
++    const size_t nbytes = tensor_nbytes(out);
++    if (fsize <= 0) return false;
++
++    std::vector<char> buf(static_cast<size_t>(fsize));
++    f.read(buf.data(), buf.size());
++    if (!f) return false;
++
++    // Copy min(file_size, tensor_size) bytes
++    const size_t to_copy = std::min(nbytes, buf.size());
++    std::memcpy(out.data, buf.data(), to_copy);
++
++    // Zero the remainder if file is smaller than tensor
++    if (to_copy < nbytes) {
++      std::memset(static_cast<char*>(out.data) + to_copy, 0, nbytes - to_copy);
++      std::fprintf(stderr,
++                   "[CPU] %s: file smaller than tensor (%zu < %zu); zero-filled remainder\n",
++                   path.c_str(), static_cast<size_t>(buf.size()), nbytes);
++    } else if (buf.size() > nbytes) {
++      std::fprintf(stderr,
++                   "[CPU] %s: file larger than tensor (%zu > %zu); truncated\n",
++                   path.c_str(), static_cast<size_t>(buf.size()), nbytes);
++    }
++    return true;
++  }
++} // namespace
++
++// -------------------------------------------------------------
++// CPU fallback: single VB1940 frame from file into output tensor
++// -------------------------------------------------------------
++void loop_single_vb1940_from_file(LoopConfig& cfg,
++                                  std::string& path,
++                                  hololink::emulation::sensors::Vb1940Emulator& vb,
++                                  hololink::emulation::DataPlane& dp,
++                                  DLTensor& out)
++{
++  // Suppress unused parameter warnings until you wire them:
++  (void)cfg; (void)vb; (void)dp;
++
++  const bool ok = read_file_into_tensor(path, out);
++  if (!ok) {
++    // Fallback to a deterministic synthetic pattern so downstream can proceed.
++    static uint64_t seed = 0xC0FFEEULL;
++    fill_buffer_with_pattern(out, seed);
++    std::fprintf(stderr,
++                 "[CPU] loop_single_vb1940_from_file: failed to read '%s'; filled synthetic pattern (seed=0x%llx)\n",
++                 path.c_str(), static_cast<unsigned long long>(seed));
++    seed = seed * 11400714819323198485ULL + 0x9E3779B97F4A7C15ULL; // change seed per call
++  } else {
++    std::fprintf(stderr,
++                 "[CPU] loop_single_vb1940_from_file: loaded raw frame from '%s'\n",
++                 path.c_str());
++  }
++
++  // TODO: if you have a CPU path to push this frame via DataPlane, do it here.
++  // dp.push(out); // pseudo-code
++}
++
++// -------------------------------------------------------------
++// CPU fallback: single VB1940 frame (synthetic) into output tensor
++// -------------------------------------------------------------
++void loop_single_vb1940(LoopConfig& cfg,
++                        hololink::emulation::sensors::Vb1940Emulator& vb,
++                        hololink::emulation::DataPlane& dp,
++                        DLTensor& out)
++{
++  (void)cfg; (void)vb; (void)dp;
++
++  static uint64_t frame_id = 0;
++  const uint64_t seed = (frame_id * 1315423911ULL) ^ 0xBADC0FFEEULL;
++  fill_buffer_with_pattern(out, seed);
++
++  std::fprintf(stderr,
++               "[CPU] loop_single_vb1940: frame=%llu (synthetic buffer filled)\n",
++               static_cast<unsigned long long>(frame_id));
++  ++frame_id;
++
++  // TODO: if a CPU DataPlane API exists, push the tensor here.
++  // dp.push(out); // pseudo-code
++}
++
++// ----------------------------------------------------------------------
++// CPU fallback: stereo VB1940 loop
++// Populates left/right DLTensors with simple patterns (no CUDA).
++// ----------------------------------------------------------------------
++void loop_stereo_vb1940(LoopConfig& cfg,
++                        hololink::emulation::sensors::Vb1940Emulator& left_emul,
++                        hololink::emulation::DataPlane& left_dp,
++                        DLTensor& left_out,
++                        hololink::emulation::sensors::Vb1940Emulator& right_emul,
++                        hololink::emulation::DataPlane& right_dp,
++                        DLTensor& right_out)
++{
++  // NOTE:
++  //  - This implementation avoids CUDA entirely.
++  //  - It does not push to DataPlane; it only fills the output tensors.
++  //    If you have non-CUDA push APIs (e.g., left_dp.push(left_out)), you can add them here.
++
++  static uint64_t frame_id = 0;
++
++  // Different seeds so left/right are distinguishable
++  const uint64_t left_seed  = (frame_id * 1315423911ULL) ^ 0xA5A5A5A5u;
++  const uint64_t right_seed = (frame_id * 11400714819323198485ULL) ^ 0x5A5A5A5Au;
++
++  fill_buffer_with_pattern(left_out, left_seed);
++  fill_buffer_with_pattern(right_out, right_seed);
++
++  std::fprintf(stderr,
++               "[CPU] loop_stereo_vb1940 frame=%llu (left/right buffers filled)\n",
++               static_cast<unsigned long long>(frame_id));
++  ++frame_id;
++
++  // If needed, wire non-CUDA data-plane calls here:
++  // left_dp.push(left_out);   // pseudo-code
++  // right_dp.push(right_out); // pseudo-code
++}
++
++// Load the data from the file into a single block of memory
++std::shared_ptr<uint8_t> load_data(const std::string& filename, int64_t& n_bytes, bool gpu)
++{
++    FILE* file = fopen(filename.c_str(), "rb");
++    if (file == nullptr) {
++        fprintf(stderr, "Failed to open file: %s, error: %d - %s", filename.c_str(), errno, strerror(errno));
++        return nullptr;
++    }
++    fseek(file, 0, SEEK_END);
++    long file_size = ftell(file);
++    if (file_size < 0) {
++        fprintf(stderr, "Failed to get file size: %s, error: %d - %s", filename.c_str(), errno, strerror(errno));
++        return nullptr;
++    }
++    fseek(file, 0, SEEK_SET);
++    uint8_t* data = new uint8_t[file_size];
++    long bytes_read = fread(data, 1, file_size, file);
++    if (bytes_read != file_size) {
++        fprintf(stderr, "Failed to read full file: %s - expected %ld bytes, read %ld bytes, error: %d - %s", filename.c_str(), file_size, bytes_read, errno, strerror(errno));
++        delete[] data;
++        return nullptr;
++    }
++    fclose(file);
++    n_bytes = file_size;
++    std::shared_ptr<uint8_t> data_ptr = nullptr;
++    if (gpu) {
++        fprintf(stderr, "CUDA allocation failed\n");
++    } else {
++        data_ptr = std::shared_ptr<uint8_t>(data, std::default_delete<uint8_t[]>());
++    }
++    return data_ptr;
++}
++
++// sleep the thread to try to match target frame rate
++void sleep_frame_rate(struct timespec* frame_start_time, struct LoopConfig& loop_config)
++{
++    struct timespec now;
++    clock_gettime(CLOCK_MONOTONIC, &now);
++    int64_t delta_sec = now.tv_sec - frame_start_time->tv_sec;
++    int64_t delta_nsec = now.tv_nsec - frame_start_time->tv_nsec;
++    if (delta_nsec < 0) {
++        delta_sec--;
++        delta_nsec += NS_PER_SEC;
++    }
++    int delta_ms = static_cast<int>(MS_PER_SEC / loop_config.frame_rate_per_second - MS_PER_SEC * (delta_sec + delta_nsec * SEC_PER_NS));
++    if (delta_ms > 0) {
++        std::this_thread::sleep_for(std::chrono::milliseconds(delta_ms));
++    }
++}
++
++// Minimal CPU fallback — replace with your real logic
++void loop_single_from_file(struct LoopConfig& loop_config, std::string& filename,
++		           hololink::emulation::DataPlane& channel, DLTensor& tensor)
++{
++	int64_t n_bytes = 0;
++    int64_t& frame_size = tensor.shape[0];
++   // std::shared_ptr<uint8_t> data = load_data(filename, n_bytes, tensor.device.device_type == DLDeviceType::kDLCPU);
++    std::shared_ptr<uint8_t> data = load_data(filename, n_bytes, false);
++    if (!data) {
++        fprintf(stderr, "Failed to load data from file: %s\n", filename.c_str());
++        exit(EXIT_FAILURE);
++    }
++
++    if (!frame_size) {
++        frame_size = n_bytes;
++    }
++
++    if (frame_size > n_bytes) {
++        fprintf(stderr, "frame size is larger than the file size: %" PRId64 " > %" PRId64 "\n", frame_size, n_bytes);
++        exit(EXIT_FAILURE);
++    }
++
++    unsigned int frame_count = 0;
++    int64_t data_offset = 0;
++    while ((!loop_config.num_frames || (frame_count < loop_config.num_frames))) {
++        struct timespec frame_start_time;
++        clock_gettime(CLOCK_MONOTONIC, &frame_start_time);
++        tensor.data = data.get() + data_offset;
++        int64_t sent_bytes = channel.send(tensor);
++        if (sent_bytes < 0) {
++            fprintf(stderr, "Error sending data: %" PRId64 "\n", sent_bytes);
++        }
++        if (sent_bytes > 0) {
++            frame_count++;
++            data_offset += frame_size;
++            if (data_offset > n_bytes - frame_size) {
++                data_offset = 0;
++                ;
++            }
++        }
++        sleep_frame_rate(&frame_start_time, loop_config);
++    }
++
++  // TODO: Implement actual CPU path (read frame(s) from "path" and push via dp)
++  // For now, just log and return so linking succeeds.
++//  std::fprintf(stderr,
++  //             "[emulator_utils_cpu] loop_single_from_file: CPU fallback invoked for '%s'\n",
++    //           path.c_str());
++  // Example of copying a buffer into out.data (if you have a frame in memory):
++  // std::memcpy(out.data, source, size);
++}
+diff --git a/src/hololink/emulation/examples/serve_linux_file.cpp b/src/hololink/emulation/examples/serve_linux_file.cpp
+index 8681121..10f7c37 100644
+--- a/src/hololink/emulation/examples/serve_linux_file.cpp
++++ b/src/hololink/emulation/examples/serve_linux_file.cpp
+@@ -1,6 +1,7 @@
+ /**
+  * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+  * SPDX-License-Identifier: Apache-2.0
++ * Copyright 2026 NXP
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -20,6 +21,7 @@
+ #include <getopt.h>
+ #include <stdio.h>
+ #include <string.h>
++#include <climits>
+ 
+ #include "dlpack/dlpack.h"
+ #include "emulator_utils.hpp"
+diff --git a/src/hololink/emulation/examples/serve_linux_stream_dpdk.cpp b/src/hololink/emulation/examples/serve_linux_stream_dpdk.cpp
+new file mode 100644
+index 0000000..3871c03
+--- /dev/null
++++ b/src/hololink/emulation/examples/serve_linux_stream_dpdk.cpp
+@@ -0,0 +1,884 @@
++/*
++ * SPDX-License-Identifier: Apache-2.0
++ * Copyright 2026 NXP
++ */
++
++#include <getopt.h>
++#include <stdio.h>
++#include <string.h>
++#include <climits>
++#include <fcntl.h>
++#include <unistd.h>
++#include <sys/ioctl.h>
++#include <sys/mman.h>
++#include <sys/sysinfo.h>
++#include <linux/videodev2.h>
++#include <vector>
++#include <chrono>
++#include <thread>
++#include "dlpack/dlpack.h"
++#include "emulator_utils.hpp"
++#include "hololink/emulation/hsb_config.hpp"
++#include "hololink/emulation/linux_data_plane.hpp"
++#include <signal.h>
++
++#include <rte_eal.h>
++#include <rte_ether.h>
++#include <rte_ethdev.h>
++#include <rte_cycles.h>
++#include <rte_lcore.h>
++#include <rte_mbuf.h>
++#include <rte_io.h>
++#include <rte_malloc.h>
++#include <rte_version.h>
++#include <rte_hexdump.h>
++
++#define DPDK_VER_GE(YY, MM) \
++  (RTE_VERSION >= RTE_VERSION_NUM((YY), (MM), 0, 0))
++
++#ifdef ROCEv2
++#define N_LINE_CONSUMED     2
++#else
++#define N_LINE_CONSUMED     1
++#endif
++
++#define CAMERA_DATAPATH_FRAMESTATUS
++//#define EXTRA_DEBUGS
++//#define ENABLE_CACHE_INST
++#define ENABLE_LATENCY
++#define PRINT_INT    5000 /* print every 5 sec */
++#define RX_RING_SIZE 1024
++#define TX_RING_SIZE 1024
++
++#define NUM_MBUFS 8191
++#define MBUF_CACHE_SIZE 256
++#define BURST_SIZE 32
++
++#define DEFAULT_FRAME_RATE_PER_SECOND 60
++#define DEFAULT_NUM_FRAMES 0
++#define NUM_BUFFERS 4
++#define METADATA_BYTES 175
++#define OPTICAL_BLACK_LINES 8
++#define CAMERA_LINE_RESERVE 128 /* reserved for headers 14 + 20 + 8 + 12 + 16 + 4, Aligned to 64*/
++#define CAMERA_WIDTH 3840
++#define CAMERA_HEIGHT 2160
++
++unsigned int num_frames = DEFAULT_NUM_FRAMES;
++unsigned int p_format;
++static struct rte_eth_conf port_conf = {
++    .txmode = {
++#if DPDK_VER_GE(22, 11)
++               .mq_mode = RTE_ETH_MQ_TX_NONE,
++	       .offloads = (RTE_ETH_TX_OFFLOAD_IPV4_CKSUM |
++			       RTE_ETH_TX_OFFLOAD_UDP_CKSUM )
++#else
++                .mq_mode = ETH_MQ_TX_NONE,
++#endif
++    },
++};
++
++using namespace hololink::emulation;
++
++static struct rte_mempool *mbuf_pool;
++static struct rte_mbuf_ext_shared_info shinfo;
++
++#define dccivac(p) { asm volatile("dc civac, %0" : : "r"(p) : "memory"); }
++
++void handle_signal(int sig) {
++    const char msg[] = "Signal received\n";
++    write(STDERR_FILENO, msg, sizeof(msg) - 1);  // async-signal-safe
++
++    // Handle specific signals
++    if (sig == SIGTERM || sig == SIGINT) {
++        num_frames = 1;
++    }
++}
++
++static int
++xioctl(int fh, int request, void *arg)
++{
++	int r;
++
++	do {
++		r = ioctl(fh, request, arg);
++	} while (-1 == r && EINTR == errno);
++
++	return r;
++}
++static void
++ext_buf_free_callback_fn(void *addr __rte_unused, void *opaque __rte_unused)
++{
++}
++#define FMT_NUM_PLANES  1
++struct buffer {
++	void   *start[FMT_NUM_PLANES];
++	size_t  phys_addr[FMT_NUM_PLANES];
++	size_t  length[FMT_NUM_PLANES];
++};
++
++void print_usage(char const* program_name) {
++    printf("Usage: %s <hololink_ip_address> <video_device> [options]\n"
++           "    Streams live video from V4L2 device through HSB Emulator\n\n"
++           "    hololink_ip_address: IP address of the HSB Emulator device\n"
++           "    video_device: V4L2 device path (e.g., /dev/video2)\n"
++           "    -r, --frame-rate FRAME_RATE: frames per second (default: %d)\n"
++           "    -f, --pixel-format 0/1: (0 = V4L2_PIX_FMT_SBGGR10, 1 = V4L2_PIX_FMT_SRGGB12)\n"
++           "    -n, --no-set-format: Don't set format, use current device format\n"
++           "    Example: %s 192.168.0.221 /dev/video2\n",
++        program_name, DEFAULT_FRAME_RATE_PER_SECOND, DEFAULT_NUM_FRAMES, program_name);
++}
++
++/**
++ * Pack 16-bit BG10 data into CSI-2 RAW10 format
++ * 4 pixels (10-bit each) packed into 5 bytes
++ */
++void pack_raw10(const uint16_t* input, uint8_t* output, size_t width, size_t height) {
++    for (size_t y = 0; y < height; y++) {
++        size_t in_row_offset = y * width;
++        size_t out_row_offset = y * (width * 10 / 8);
++
++        for (size_t x = 0; x < width; x += 4) {
++            size_t in_idx = in_row_offset + x;
++            size_t out_idx = out_row_offset + (x * 10 / 8);
++
++            uint16_t p0 = input[in_idx + 0] & 0x3FF;
++            uint16_t p1 = input[in_idx + 1] & 0x3FF;
++            uint16_t p2 = input[in_idx + 2] & 0x3FF;
++            uint16_t p3 = input[in_idx + 3] & 0x3FF;
++
++            // Pack: [P0[9:2], P1[9:2], P2[9:2], P3[9:2], P3[1:0]P2[1:0]P1[1:0]P0[1:0]]
++            output[out_idx + 0] = (p0 >> 2) & 0xFF;
++            output[out_idx + 1] = (p1 >> 2) & 0xFF;
++            output[out_idx + 2] = (p2 >> 2) & 0xFF;
++            output[out_idx + 3] = (p3 >> 2) & 0xFF;
++            output[out_idx + 4] = ((p3 & 0x3) << 6) | ((p2 & 0x3) << 4) |
++                                   ((p1 & 0x3) << 2) | ((p0 & 0x3) << 0);
++        }
++    }
++}
++
++#define RTE_ETH_ADDR_BYTES(mac_addrs) ((mac_addrs)->addr_bytes[0]), \
++                                         ((mac_addrs)->addr_bytes[1]), \
++                                         ((mac_addrs)->addr_bytes[2]), \
++                                         ((mac_addrs)->addr_bytes[3]), \
++                                         ((mac_addrs)->addr_bytes[4]), \
++                                         ((mac_addrs)->addr_bytes[5])
++
++static void *isi_baseaddr_v;
++size_t ccsr_addr;
++#define MAX_LINE_SIZE		64
++#define ISI_CCSR_SIZE		0x10000
++#define EXTRACT_CCSR_ADDR(s)	(s + strlen(s) - 8)
++
++/* Channel Interrupt Enable Register */
++#define  CHNL_IER				0x10
++#define  CHNL_IER_FRM_RCVD_EN_OFFSET		29
++#define  CHNL_IER_FRM_RCVD_EN_MASK		0x20000000
++/* Channel Status Register */
++#define  CHNL_STS				0x14
++#define  CHNL_STS_LINE_STRD_OFFSET		30
++#define  CHNL_STS_LINE_STRD_MASK		0x40000000
++#define  CHNL_STS_FRM_STRD_MASK			0x20000000
++/* Channel RGB or Luma (Y) Output Buffer 1 Address */
++#define  CHNL_OUT_BUF1_ADDR_Y			0x70
++/* Channel RGB or Luma (Y) Output Buffer 2 Address */
++#define  CHNL_OUT_BUF2_ADDR_Y		0x8C
++#define  CHNL_OUT_BUF_CTRL		0x8
++#define  CHNL_OUT_BUF_CTRL_LOAD_BUF1_ADDR_MASK			0x4000
++#define  CHNL_OUT_BUF_CTRL_LOAD_BUF2_ADDR_MASK			0x8000
++
++static void
++isi_channel_set_outbuf(phys_addr_t paddr, int index)
++{
++       uint32_t val;
++       int offset;
++
++       if (index == 1)
++               offset = CHNL_OUT_BUF1_ADDR_Y;
++       else
++               offset = CHNL_OUT_BUF2_ADDR_Y;
++       rte_write32(rte_cpu_to_le_32(paddr), (uint8_t *)isi_baseaddr_v + offset);
++
++       val = rte_read32((uint8_t *)isi_baseaddr_v + CHNL_OUT_BUF_CTRL);
++       if (index == 1)
++               val ^= CHNL_OUT_BUF_CTRL_LOAD_BUF1_ADDR_MASK;
++       else
++               val ^= CHNL_OUT_BUF_CTRL_LOAD_BUF2_ADDR_MASK;
++       rte_write32(rte_cpu_to_le_32(val), (uint8_t *)isi_baseaddr_v + CHNL_OUT_BUF_CTRL);
++}
++static int parse_ccsr_addr(size_t *ccsr_addr, size_t *ccsr_size)
++{
++	char *dtb_entry;
++	FILE *file;
++	int ret, rt;
++	int cnt;
++
++	file = fopen("/proc/device-tree/aliases/isi0", "r");
++	if (file) {
++		dtb_entry = (char *)malloc(MAX_LINE_SIZE);
++		if (!dtb_entry) {
++			printf("malloc failed!!");
++			rt = -1;
++			fclose(file);
++			goto err;
++		}
++		memset(dtb_entry, 0, MAX_LINE_SIZE);
++		cnt = fread(dtb_entry, sizeof(char), MAX_LINE_SIZE, file);
++		/* fread success */
++		if (cnt) {
++			ret = sscanf(EXTRACT_CCSR_ADDR(dtb_entry), "%lx",
++					 ccsr_addr);
++			if (ret != 1) {
++				printf("sscanf failed!!");
++				rt = -1;
++				free(dtb_entry);
++				fclose(file);
++				goto err;
++			}
++			*ccsr_size = ISI_CCSR_SIZE;
++			printf("%s ccsr_addr=0x%lx\n", __func__, *ccsr_addr);
++		}
++		free(dtb_entry);
++		fclose(file);
++	} else {
++		printf("File open failed!!");
++		rt = -1;
++		goto err;
++	}
++
++err:
++		return rt;
++}
++
++static inline int
++port_init(uint16_t port, struct rte_mempool *mbuf_pool)
++{
++        const uint16_t rx_rings = 1, tx_rings = 1;
++        uint16_t nb_rxd = RX_RING_SIZE;
++        uint16_t nb_txd = TX_RING_SIZE;
++        int retval;
++        uint16_t q;
++        struct rte_eth_dev_info dev_info;
++        struct rte_eth_txconf txconf;
++        struct rte_eth_rxconf rxconf;
++        struct rte_eth_conf local_port_conf = port_conf;
++
++        if (!rte_eth_dev_is_valid_port(port))
++                return -1;
++
++        retval = rte_eth_dev_info_get(port, &dev_info);
++        if (retval != 0) {
++                printf("Error during getting device (port %u) info: %s\n",
++                                port, strerror(-retval));
++                return retval;
++        }
++
++#if DPDK_VER_GE(22, 11)
++	if (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE) { //for 22.11 onwards
++                local_port_conf.txmode.offloads |=
++                        RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE;
++	}
++#else
++	if (dev_info.tx_offload_capa & DEV_TX_OFFLOAD_MBUF_FAST_FREE) {
++                local_port_conf.txmode.offloads |=
++                        DEV_TX_OFFLOAD_MBUF_FAST_FREE;
++	}
++#endif
++
++        /* Configure the Ethernet device. */
++        retval = rte_eth_dev_configure(port, rx_rings, tx_rings, &local_port_conf);
++        if (retval != 0)
++                return retval;
++
++        retval = rte_eth_dev_adjust_nb_rx_tx_desc(port, &nb_rxd, &nb_txd);
++        if (retval != 0)
++                return retval;
++
++        rxconf = dev_info.default_rxconf;
++        rxconf.offloads = local_port_conf.rxmode.offloads;
++        /* Allocate and set up 1 RX queue per Ethernet port. */
++        for (q = 0; q < rx_rings; q++) {
++                retval = rte_eth_rx_queue_setup(port, q, nb_rxd,
++                                rte_eth_dev_socket_id(port), &rxconf, mbuf_pool);
++                if (retval < 0)
++                        return retval;
++        }
++
++        txconf = dev_info.default_txconf;
++        txconf.offloads = local_port_conf.txmode.offloads;
++        /* Allocate and set up 1 TX queue per Ethernet port. */
++        for (q = 0; q < tx_rings; q++) {
++                retval = rte_eth_tx_queue_setup(port, q, nb_txd,
++                                rte_eth_dev_socket_id(port), &txconf);
++                if (retval < 0)
++                        return retval;
++        }
++
++        /* Starting Ethernet port. 8< */
++        retval = rte_eth_dev_start(port);
++        /* >8 End of starting of ethernet port. */
++        if (retval < 0)
++                return retval;
++
++        /* Display the port MAC address. */
++        struct rte_ether_addr addr;
++        retval = rte_eth_macaddr_get(port, &addr);
++        if (retval != 0)
++                return retval;
++
++        printf("Port %u MAC: %02" PRIx8 " %02" PRIx8 " %02" PRIx8
++                           " %02" PRIx8 " %02" PRIx8 " %02" PRIx8 "\n",
++                        port, RTE_ETH_ADDR_BYTES(&addr));
++
++        return 0;
++}
++
++
++char* int_to_str(int value) {
++    char* s = (char *)malloc(32);
++    if (!s) return NULL;
++    snprintf(s, 16, "%d", value);
++    return s;
++}
++
++
++int main(int argc, char** argv) {
++    unsigned int nb_ports;
++    uint16_t portid;
++    struct rte_eth_dev_info dev_info;
++
++    int ncpu = get_nprocs_conf();
++    int ctrl_core = 0;
++    int data_core = 2;
++
++    if (argc < 3) {
++        print_usage(argv[0]);
++        exit(EXIT_FAILURE);
++    }
++
++    std::string ip_address = argv[1];
++    std::string video_device = argv[2];
++
++    bool skip_format_set = false;
++    // Parse optional arguments
++    int c;
++    while (1) {
++        static struct option long_options[] = {
++            { "frame-limit", required_argument, NULL, 'l' },
++            { "pixel-format", required_argument, NULL, 'n' },
++	    { "ctrl-core", required_argument, 0, 'c'},
++            { "data-core", required_argument, 0, 'd'},
++            { "no-set-format", no_argument, NULL, 'n' },
++            { 0, 0, 0, 0 }
++        };
++        int option_index = 0;
++        c = getopt_long(argc, argv, "f:l:c:d:en", long_options, &option_index);
++        if (c == -1) break;
++
++        switch (c) {
++            case 'l':
++                num_frames = atoi(optarg);
++                break;
++            case 'f':
++                p_format = atoi(optarg);
++                break;
++            case 'c':
++                ctrl_core = atoi(optarg);
++                break;
++            case 'd':
++                data_core = atoi(optarg);
++                break;
++            case 'n':
++                skip_format_set = true;
++                break;
++            default:
++                print_usage(argv[0]);
++                exit(EXIT_FAILURE);
++        }
++    }
++
++    // Validate required args
++    if (ctrl_core < 0 || data_core < 0) {
++        fprintf(stderr, "Both --ctrl-core and --data-core are required.\n");
++        print_usage(argv[0]);
++        return 2;
++    }
++
++    // Validate within CPU count
++    if (ctrl_core >= ncpu || data_core >= ncpu) {
++        fprintf(stderr, "Core index out of range. System has %d CPU(s).\n", ncpu);
++        return 2;
++    }
++
++    printf("[info] System CPUs: %d\n", ncpu);
++    printf("[info] Control thread -> core %d\n", ctrl_core);
++    printf("[info] Data thread    -> core %d\n", data_core);
++
++    char *_argv[] = {argv[0], (char *)"-l", (char *)int_to_str(ctrl_core),
++                (char *)"--log-level", (char *)"8"};
++    int _argc = sizeof(_argv) / (sizeof(_argv[0]));
++
++    if (rte_eal_init(_argc, (char **)_argv) < 0) {
++        perror("Failed to init eal");
++        exit(EXIT_FAILURE);
++    }
++
++    struct sigaction sa;
++    sa.sa_handler = handle_signal;
++    sigemptyset(&sa.sa_mask);
++    sa.sa_flags = SA_RESTART;
++
++    // Register signals
++    sigaction(SIGINT, &sa, NULL);   // Ctrl+C
++    sigaction(SIGTERM, &sa, NULL);
++    sigaction(SIGSEGV, &sa, NULL);
++    sigaction(SIGHUP, &sa, NULL);
++
++    nb_ports = rte_eth_dev_count_avail();
++    printf("*****Available DPDK ports = %d ****\n", nb_ports);
++    /* Allocates mempool to hold the mbufs. 8< */
++    mbuf_pool = rte_pktmbuf_pool_create("MBUF_POOL", NUM_MBUFS * nb_ports,
++             MBUF_CACHE_SIZE, 0, 8192/*RTE_MBUF_DEFAULT_BUF_SIZE*/, rte_socket_id());
++    /* >8 End of allocating mempool to hold mbuf. */
++
++    if (mbuf_pool == NULL) {
++            perror("Cannot create mbuf pool\n");
++        exit(EXIT_FAILURE);
++   }
++
++    /* Initializing all ports. 8< */
++    RTE_ETH_FOREACH_DEV(portid) {
++#ifdef EXTRA_DEBUGS
++	    printf("rte_eth_dev_is_valid_port = %d and id = %d\n", rte_eth_dev_is_valid_port(portid), portid);
++#endif
++           if (port_init(portid, mbuf_pool) != 0) {
++                printf("Cannot init port %d\n",portid);
++		exit(EXIT_FAILURE);
++	   }
++	   if (rte_eth_dev_is_valid_port(portid))
++		   break;
++    }
++    int ret = rte_eth_dev_info_get(portid, &dev_info);
++    printf("DPDK Devide ID = %d and driver name = %s\n", portid, dev_info.driver_name);
++
++     // Map ISI base
++	size_t ccsr_addr, ccsr_size;
++    int isi_fd = open("/dev/mem", O_RDWR);
++
++    parse_ccsr_addr(&ccsr_addr, &ccsr_size);
++	if (isi_fd) {
++		isi_baseaddr_v = mmap(NULL, ccsr_size, PROT_READ | PROT_WRITE,
++				      MAP_SHARED, isi_fd, ccsr_addr);
++		if (isi_baseaddr_v == MAP_FAILED) {
++			perror("Can not map CCSR base");
++			close(isi_fd);
++            exit(EXIT_FAILURE);
++		}
++		close(isi_fd);
++	} else {
++		perror("Failed to open /dev/mem");
++        exit(EXIT_FAILURE);
++	}
++
++    // Open V4L2 device
++    int fd = open(video_device.c_str(), O_RDWR | O_NONBLOCK);
++    if (fd < 0) {
++        perror("Failed to open video device");
++        exit(EXIT_FAILURE);
++    }
++
++    // Get or set format
++    struct v4l2_format fmt = {};
++    fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
++
++    if (skip_format_set) {
++        // Just get the current format
++        if (xioctl(fd, VIDIOC_G_FMT, &fmt) < 0) {
++            perror("Failed to get format");
++            close(fd);
++            exit(EXIT_FAILURE);
++        }
++        printf("Using current format from device\n");
++    } else {
++        // Get current format first
++        if (xioctl(fd, VIDIOC_G_FMT, &fmt) < 0) {
++            perror("Failed to get format");
++            close(fd);
++            exit(EXIT_FAILURE);
++        }
++
++        // Try to set BG10 format
++	switch (p_format) {
++	case 0:
++		fmt.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_SBGGR10;
++		printf("Using pixel format V4L2_PIX_FMT_SBGGR10\n");
++		break;
++	case 1:
++	default:
++		fmt.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_SRGGB12;
++		printf("Using pixel format V4L2_PIX_FMT_SRGGB12\n");
++	}
++        fmt.fmt.pix_mp.field = V4L2_FIELD_NONE;
++	fmt.fmt.pix_mp.width       = CAMERA_WIDTH;
++        fmt.fmt.pix_mp.height      = CAMERA_HEIGHT;
++	fmt.fmt.pix_mp.plane_fmt[0].bytesperline  = CAMERA_WIDTH * 2 + CAMERA_LINE_RESERVE;
++        fmt.fmt.pix_mp.plane_fmt[0].sizeimage  = fmt.fmt.pix_mp.plane_fmt[0].bytesperline * CAMERA_HEIGHT;
++
++        if (xioctl(fd, VIDIOC_S_FMT, &fmt) < 0) {
++            perror("Failed to set format (try using --no-set-format)");
++            close(fd);
++            exit(EXIT_FAILURE);
++        }
++    }
++
++
++	switch (p_format) {
++	case 0:
++		// Verify it's BG10 format
++		if (fmt.fmt.pix_mp.pixelformat != V4L2_PIX_FMT_SBGGR10) {
++			fprintf(stderr, "Error: Expected BG10 format (0x%x), got 0x%x\n",
++					V4L2_PIX_FMT_SBGGR10, fmt.fmt.pix_mp.pixelformat);
++			close(fd);
++			exit(EXIT_FAILURE);
++		}
++		break;
++	case 1:
++	default:
++		if (fmt.fmt.pix_mp.pixelformat != V4L2_PIX_FMT_SRGGB12) {
++			fprintf(stderr, "Error: Expected GB12 format (0x%x), got 0x%x\n",
++					V4L2_PIX_FMT_SRGGB12, fmt.fmt.pix_mp.pixelformat);
++			close(fd);
++			exit(EXIT_FAILURE);
++		}
++	}
++
++
++    unsigned int width = fmt.fmt.pix_mp.width;
++    unsigned int height = fmt.fmt.pix_mp.height;
++    size_t v4l2_frame_size = fmt.fmt.pix_mp.plane_fmt[0].sizeimage;
++    size_t bytes_per_line = fmt.fmt.pix_mp.plane_fmt[0].bytesperline;
++
++    printf("V4L2 format: %ux%u, frame size: %zu B , Stride %zu B\n", width, height, v4l2_frame_size, bytes_per_line);
++    // Calculate CSI frame size
++    size_t header_size = METADATA_BYTES + (OPTICAL_BLACK_LINES * bytes_per_line);
++    size_t packed_image_size = (width * height * 10) / 8;
++    size_t csi_frame_size = header_size + packed_image_size;
++
++#ifdef EXTRA_DEBUGS
++    printf("CSI frame size: %zu bytes (header: %zu, image: %zu)\n",
++           csi_frame_size, header_size, packed_image_size);
++#endif
++
++    const size_t raw_bytes_per_line = width * sizeof(uint16_t);
++    const size_t raw_image_size     = raw_bytes_per_line * height;
++    printf("RAW Bayer mode: 2D uint16 [%u x %u], %zu bytes\n",
++           width, height, raw_image_size);
++    // Allocate conversion buffer
++    std::vector<uint8_t> csi_frame(raw_image_size, 0);
++
++    // Request buffers - use minimum for lower latency
++    struct v4l2_requestbuffers req = {};
++    req.count = NUM_BUFFERS;
++    req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
++    req.memory = V4L2_MEMORY_MMAP;
++
++    if (xioctl(fd, VIDIOC_REQBUFS, &req) < 0) {
++        perror("Failed to request buffers");
++        close(fd);
++        exit(EXIT_FAILURE);
++    }
++
++    printf("Allocated %d buffers\n", req.count);
++	if (req.count < NUM_BUFFERS) {
++        perror("Failed to request min buffers");
++        close(fd);
++		exit(EXIT_FAILURE);
++	}
++
++
++    // Map buffers
++    struct buffer buffers[NUM_BUFFERS];
++    for (unsigned int i = 0; i < req.count; i++) {
++        struct v4l2_buffer buf = {};
++        struct v4l2_plane planes[1];
++        int p_idx = 0;
++
++        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
++        buf.memory = V4L2_MEMORY_MMAP;
++        buf.m.planes = planes;
++        buf.length = 1;
++        buf.index = i;
++
++        if (xioctl(fd, VIDIOC_QUERYBUF, &buf) < 0) {
++            close(fd);
++            perror("Failed to query buffer");
++            exit(EXIT_FAILURE);
++        }
++
++        buffers[i].length[p_idx] = buf.m.planes[p_idx].length;
++        buffers[i].start[p_idx] = mmap(NULL, buf.m.planes[p_idx].length, PROT_READ | PROT_WRITE,
++                                MAP_SHARED, fd, buf.m.planes[p_idx].m.mem_offset);
++        if (buffers[i].start == MAP_FAILED) {
++            perror("Failed to mmap buffer");
++            close(fd);
++            exit(EXIT_FAILURE);
++        }
++
++        if (xioctl(fd, VIDIOC_QUERYBUF, &buf) < 0) {
++            perror("Failed to query buffer");
++            close(fd);
++            exit(EXIT_FAILURE);
++        }
++		buffers[i].phys_addr[p_idx] = buf.m.planes[p_idx].m.mem_offset;
++        printf("Mapping Phyaddr 0x%X Length %zu --> mapped vaddr[%d] %p\n",
++                buffers[i].phys_addr[p_idx], buffers[i].length[p_idx], i, buffers[i].start);
++    }
++
++    // Queue buffers
++    for (unsigned int i = 0; i < req.count; i++) {
++        struct v4l2_buffer buf = {};
++        struct v4l2_plane planes[1];
++        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
++        buf.memory = V4L2_MEMORY_MMAP;
++        buf.index = i;
++        buf.m.planes = planes;
++        buf.length = 1;
++
++        if (xioctl(fd, VIDIOC_QBUF, &buf) < 0) {
++            perror("Failed to queue buffer");
++            close(fd);
++            exit(EXIT_FAILURE);
++        }
++    }
++
++    // Start streaming
++    enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
++    if (xioctl(fd, VIDIOC_STREAMON, &type) < 0) {
++        perror("Failed to start streaming");
++        close(fd);
++        exit(EXIT_FAILURE);
++    }
++
++    printf("V4L2 streaming started\n");
++
++    // Setup HSB Emulator
++    HSBEmulator hsb;
++    uint8_t data_plane_id = 0;
++    uint8_t sensor_id = 0;
++    LinuxDataPlane linux_data_plane(
++        hsb,
++        IPAddress_from_string(ip_address),
++        data_plane_id,
++        sensor_id);
++
++    hsb.start();
++    printf("Streaming from %s to %s ... Press Ctrl+C to stop\n",
++           video_device.c_str(), ip_address.c_str());
++
++    int i;
++    size_t src_bpl = fmt.fmt.pix_mp.plane_fmt[0].bytesperline
++                       ? fmt.fmt.pix_mp.plane_fmt[0].bytesperline
++                       : width * sizeof(uint16_t);
++
++	int64_t shape[1] = { width };
++	DLTensor tensor1d = {
++		.device = { .device_type = kDLCPU, .device_id = 0 },
++		.ndim = 1,
++		.dtype = DLDataType{ .code = kDLUInt, .bits = 16, .lanes = 1 },
++		.shape = shape,
++		.strides = nullptr,
++		.byte_offset = 0
++	};
++
++
++	/* use 1 & 2 indexed buffer */
++	for (i = 1; i <= 2; ++i)
++		isi_channel_set_outbuf(buffers[i].phys_addr[0], i);
++	// Disable ISI IRQ
++	rte_write32(0, (uint8_t *)isi_baseaddr_v + CHNL_IER);
++
++#ifdef ENABLE_LATENCY
++	auto start_time = std::chrono::steady_clock::now();
++	// For latency measurement
++	auto last_report_time = start_time;
++#endif
++
++	// Capture and send frames
++	unsigned int frame_count = 0;
++	unsigned int frames_since_report = 0;
++
++	int bufid, status = 0, frame_ready = 0;
++	int line_no = 0, is_last = 0, line_ready_cnt = 0;
++	size_t   frame_bytes = 0;
++	uint32_t offset = frame_bytes;
++
++
++cpu_set_t set;
++    CPU_ZERO(&set);
++    CPU_SET(data_core, &set);
++
++if (sched_setaffinity(0, sizeof(set), &set) != 0) {
++        perror("sched_setaffinity");
++        return 1;
++    }
++
++
++	int core = sched_getcpu();
++    printf("Data processing on CPU core: %d\n", core);
++
++#ifdef CAMERA_DATAPATH_FRAMESTATUS
++	while (num_frames == 0 || frame_count < num_frames) {
++#ifdef ENABLE_LATENCY
++		auto frame_start = std::chrono::steady_clock::now();
++#endif
++        /* Wait for next Frame to start */
++        while (!frame_ready) {
++	        status = rte_read32((uint8_t *)isi_baseaddr_v + CHNL_STS);
++		    rte_write32(rte_cpu_to_le_32(status), (uint8_t *)isi_baseaddr_v + CHNL_STS);
++			if (status & CHNL_STS_FRM_STRD_MASK)
++                frame_ready = 1;
++            //usleep(10);
++        }
++        // Current Buffer
++	    bufid = ((status >> 8) & 0x3);
++		line_no = is_last = frame_bytes = offset = frame_ready = 0;
++
++//        usleep(100); // Lets some lines get populated
++		while (line_no < height) {
++			status = rte_read32((uint8_t *)isi_baseaddr_v + CHNL_STS);
++			rte_write32(rte_cpu_to_le_32(status), (uint8_t *)isi_baseaddr_v + CHNL_STS);
++            /* Check if current Frame already comepleted */
++			if (status & CHNL_STS_FRM_STRD_MASK)
++                frame_ready = 1;
++			if (status & CHNL_STS_LINE_STRD_MASK)
++                line_ready_cnt++;
++
++			if (frame_ready){
++			    // send all remainaing lines
++				while (line_no < height) {
++				    offset = frame_bytes;
++				    if (line_no == height - N_LINE_CONSUMED)
++					    is_last = 1;
++				    else
++					    is_last = 0;
++					tensor1d.data = static_cast<void*>((uint8_t*)buffers[bufid].start[0] + offset);
++					linux_data_plane.send_dpdk(tensor1d, mbuf_pool, portid,
++							ext_buf_free_callback_fn,
++							line_no, is_last,  buffers[bufid].phys_addr[0] + offset);
++				    frame_bytes += src_bpl * N_LINE_CONSUMED;
++				    line_no = line_no + N_LINE_CONSUMED;
++				}
++                /* Here means we just sent last frame and are behind ISI rate.
++                   Continue sending next in progress frame */
++		        break;
++			}
++			//bufid = ((status >> 8) & 0x3);
++			if (line_ready_cnt == N_LINE_CONSUMED) {
++                line_ready_cnt = 0;
++				offset = frame_bytes;
++				if (line_no == height - N_LINE_CONSUMED)
++					is_last = 1;
++				else
++					is_last = 0;
++				tensor1d.data = static_cast<void*>((uint8_t*)buffers[bufid].start[0] + offset);
++				linux_data_plane.send_dpdk(tensor1d, mbuf_pool, portid,
++						ext_buf_free_callback_fn,
++						line_no, is_last,  buffers[bufid].phys_addr[0] + offset);
++				frame_bytes += src_bpl * N_LINE_CONSUMED;
++				line_no = line_no + N_LINE_CONSUMED;
++			}
++		}
++#else
++
++    /* Wait for next Frame to start */
++    while (1) {
++	    status = rte_read32((uint8_t *)isi_baseaddr_v + CHNL_STS);
++		rte_write32(rte_cpu_to_le_32(status), (uint8_t *)isi_baseaddr_v + CHNL_STS);
++		if (status & CHNL_STS_FRM_STRD_MASK)
++            break;
++    }
++	bufid = ((status >> 8) & 0x3);
++	while (num_frames == 0 || frame_count < num_frames) {
++#ifdef ENABLE_LATENCY
++		auto frame_start = std::chrono::steady_clock::now();
++#endif
++		line_no = is_last = frame_bytes = offset = 0;
++
++		while (line_no < height) {
++			status = rte_read32((uint8_t *)isi_baseaddr_v + CHNL_STS);
++			rte_write32(rte_cpu_to_le_32(status), (uint8_t *)isi_baseaddr_v + CHNL_STS);
++			if (status & CHNL_STS_LINE_STRD_MASK){
++#ifdef EXTRA_DEBUGS
++				printf("------ ISI STATUS 0x%X : frame[%d] ready. Got Lined %d frame_bytes %d\n", status, bufid, line_no, frame_bytes);
++#endif
++				offset = frame_bytes;
++				if (line_no == height - N_LINE_CONSUMED)
++					is_last = 1;
++				else
++					is_last = 0;
++				tensor1d.data = static_cast<void*>((uint8_t*)buffers[bufid].start[0] + offset);
++				linux_data_plane.send_dpdk(tensor1d, mbuf_pool, portid,
++						ext_buf_free_callback_fn,
++						line_no, is_last, buffers[bufid].phys_addr[0] + offset);
++				frame_bytes += src_bpl * N_LINE_CONSUMED;
++				line_no = line_no + N_LINE_CONSUMED;
++			}
++		}
++	    if (bufid == 1)
++            bufid = 2;
++        else
++            bufid = 1;
++#endif
++		frame_count++;
++#ifdef ENABLE_LATENCY
++		//auto dequeue_time = std::chrono::steady_clock::now();
++		frames_since_report++;
++
++		// Report timing every second
++		auto now = std::chrono::steady_clock::now();
++		auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_report_time).count();
++
++		if (elapsed >= PRINT_INT) {
++			double actual_fps = frames_since_report * 1000 / elapsed;
++			auto dequeue_us = std::chrono::duration_cast<std::chrono::microseconds>(now - frame_start).count();
++			printf("Frame %u | FPS: %.2f | Latency - Total: %ld us\n",
++					frame_count, actual_fps, dequeue_us);
++
++			last_report_time = now;
++			frames_since_report = 0;
++		}
++#endif
++	}
++
++#ifdef ENABLE_LATENCY
++    auto end_time = std::chrono::steady_clock::now();
++    auto total_time = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
++    double avg_fps = frame_count * 1000.0 / total_time;
++#endif
++
++    // Cleanup
++    printf("\nStopping streaming...\n");
++    xioctl(fd, VIDIOC_STREAMOFF, &type);
++
++    for (unsigned int i = 0; i < req.count; i++) {
++        munmap(buffers[i].start[0], buffers[i].length[0]);
++    }
++
++    close(fd);
++    hsb.stop();
++
++    RTE_ETH_FOREACH_DEV(portid) {
++                printf("Closing port %d...", portid);
++                rte_eth_dev_stop(portid);
++                rte_eth_dev_close(portid);
++                printf(" Done\n");
++        }
++
++   /* clean up the EAL */
++   rte_eal_cleanup();
++#ifdef ENABLE_LATENCY
++   printf("Streaming stopped. Sent %u frames in %ld ms (avg %.2f fps)\n",
++           frame_count, total_time, avg_fps);
++#endif
++    return 0;
++}
+diff --git a/src/hololink/emulation/linux_transmitter.cpp b/src/hololink/emulation/linux_transmitter.cpp
+index af447d7..7064790 100644
+--- a/src/hololink/emulation/linux_transmitter.cpp
++++ b/src/hololink/emulation/linux_transmitter.cpp
+@@ -1,6 +1,7 @@
+ /**
+  * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+  * SPDX-License-Identifier: Apache-2.0
++ * Copyright 2026 NXP
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -23,16 +24,36 @@
+ #include <cstring>
+ #include <stdexcept>
+ #include <thread>
+-
++#include <sys/ioctl.h>
++#include <time.h>
++#include <fcntl.h>
++#if USE_CUDA
+ #include "cuda_runtime.h"
++#endif
+ #include "dlpack/dlpack.h"
+ #include <zlib.h>
+ 
++#include <rte_ether.h>
++#include <rte_ethdev.h>
++#include <rte_ip.h>
++#include <rte_udp.h>
++#include <rte_hexdump.h>
++#include <rte_malloc.h>
++
++#include <sys/auxv.h>   // getauxval
++#include <asm/hwcap.h>  // HWCAP_CRC32
++#include <arm_acle.h>
++
+ #include "hololink/core/serializer.hpp"
+ #include "linux_transmitter.hpp"
+ #include "net.hpp"
+ #include "utils.hpp"
+ 
++//#define GCRC_UPDATE
++#define ENABLE_CACHE_INST
++//#define EXTRA_DEBUG
++//#define SW_IP_CHECK
++#define PHC_CLOCK 1
+ // payload is 1500 bytes (MTU), minus the IP header, UDP header, and CRC (4 bytes)
+ #define DEFAULT_PAYLOAD_SIZE (((1500 - sizeof(IPHeader) - sizeof(UDPHeader) - sizeof(uint32_t)) / PAGE_SIZE) * PAGE_SIZE)
+ #define DEFAULT_ROCE_PAYLOAD_SIZE (((1500 - sizeof(IPHeader) - sizeof(UDPHeader) - sizeof(BTHeader) - sizeof(RETHeader) - sizeof(uint32_t)) / PAGE_SIZE) * PAGE_SIZE)
+@@ -49,11 +70,25 @@
+ #define IB_HEADER_SIZE (BT_HEADER_SIZE + RET_HEADER_SIZE)
+ // this is specifically the payload offset for our opcode. Note that unreliable write/write immediate and other IB opcodes do not necessary have this offset
+ #define IB_PAYLOAD_OFFSET (UDP_PAYLOAD_OFFSET + IB_HEADER_SIZE)
+-
+ #define IB_PSN_MASK 0xFFFFFF
+ 
++#define TOTAL_HDR_SIZE      (sizeof(struct rte_ether_hdr) + IP_HEADER_SIZE + UDP_HEADER_SIZE + IB_HEADER_SIZE)
++
++#define dccivac(p) { asm volatile("dc civac, %0" : : "r"(p) : "memory"); }
++
++#ifndef CLOCKFD
++#define CLOCKFD 3
++#endif
++#define FD_TO_CLOCKID(fd)  ((clockid_t) (((uint64_t)~(fd) << 3) | CLOCKFD))
++
++#ifdef PHC_CLOCK
++const char *phc = "/dev/ptp0";        // adjust for your NIC
++int phc_fd = -1;
++clockid_t clkid;
++#endif
+ namespace hololink::emulation {
+ 
++#if USE_CUDA
+ static void* memcpy_gpu_to_host(void* dst, const void* src, size_t n)
+ {
+     const auto error = cudaMemcpy(dst, src, n, cudaMemcpyDeviceToHost);
+@@ -62,6 +97,7 @@ static void* memcpy_gpu_to_host(void* dst, const void* src, size_t n)
+     }
+     return dst;
+ }
++#endif
+ 
+ // reference values and magic numbers for headers.
+ // explanations of which fields are overwritten and when
+@@ -157,6 +193,124 @@ static inline size_t serialize_ret_header(hololink::core::Serializer& serializer
+         : 0;
+ }
+ 
++/* TODO: Unoptimized code for CRC concatenation, can be replaced with optimized one*/
++#if 0
++/* Multiply a GF(2) 32x32 matrix by a vector. */
++static inline uint32_t gf2_matrix_times(const uint32_t mat[32], uint32_t vec) {
++    uint32_t sum = 0;
++    unsigned i = 0;
++    while (vec) {
++        if (vec & 1)
++            sum ^= mat[i];
++        vec >>= 1;
++        i++;
++    }
++    return sum;
++}
++
++/* Square a GF(2) 32x32 matrix: square = mat * mat. */
++static inline void gf2_matrix_square(uint32_t square[32], const uint32_t mat[32]) {
++    for (int n = 0; n < 32; n++)
++        square[n] = gf2_matrix_times(mat, mat[n]);
++}
++
++/*
++ * Combine two CRC-32/IEEE (reflected) checksums:
++ *   - crc1 = CRC(M1) as returned by your crc32_hw_ieee(...)
++ *   - crc2 = CRC(M2) as returned by your crc32_hw_ieee(...)
++ *   - len2 = length of M2 in bytes
++ *
++ * Returns CRC(M1 || M2) with the same semantics as crc32_hw_ieee(0, concat, ...).
++ *
++ * This assumes you called crc32_hw_ieee with crc=0 for each segment (the usual seed).
++ * If you used a different seed, see the note below.
++ */
++uint32_t crc32_combine_ieee(uint32_t crc1, uint32_t crc2, uint64_t len2) {
++    if ((int64_t)len2 < 0)
++        return 0;                  /* or handle error as you like */
++    if (len2 == 0)
++        return crc1;
++
++    uint32_t even[32], odd[32];
++
++    /* odd = operator for one zero bit in reflected (LSB-first) model */
++    odd[0] = 0xEDB88320U;          /* reversed 0x04C11DB7 */
++    uint32_t row = 1U;
++    for (int n = 1; n < 32; n++) {
++        odd[n] = row;
++        row <<= 1;
++    }
++
++    /* even = odd^2 (advance two bits); then build higher powers by squaring */
++    gf2_matrix_square(even, odd);  /* +2 bits */
++    gf2_matrix_square(odd, even);  /* +4 bits */
++
++    /*
++     * Advance crc1 by 8*len2 zero bits using exponentiation by squaring.
++     * We alternate squaring to get +8, +16, +32, ... bytes worth of advance.
++     */
++    do {
++        gf2_matrix_square(even, odd);          /* +8, +32, +128, ... bits */
++        if (len2 & 1)
++            crc1 = gf2_matrix_times(even, crc1);
++        len2 >>= 1;
++        if (len2 == 0)
++            break;
++
++        gf2_matrix_square(odd, even);          /* next power */
++        if (len2 & 1)
++            crc1 = gf2_matrix_times(odd, crc1);
++        len2 >>= 1;
++    } while (len2);
++
++    /* Now XOR in crc2's internal state equivalently (pre/post-xor cancel out). */
++    return crc1 ^ crc2;
++}
++#endif
++
++static inline uint32_t crc32_hw_ieee(uint32_t crc, const uint8_t *buf, size_t len) {
++    if (!buf) return 0;
++    crc = ~crc;
++
++    // Align to 8 bytes
++    while (len && ((uintptr_t)buf & 7)) {
++        crc = __crc32b(crc, *buf++);
++        len--;
++    }
++
++    // 64-bit bulk
++    const uint64_t *p = (const uint64_t *)buf;
++    size_t n64 = len >> 3;
++    for (size_t i = 0; i < n64; i++) {
++        crc = __crc32d(crc, p[i]);
++    }
++
++    // tail bytes
++    buf += (n64 << 3);
++    len  &= 7;
++    while (len--) {
++        crc = __crc32b(crc, *buf++);
++    }
++    return ~crc;
++}
++
++
++__attribute__((target("+crc")))
++static uint32_t crc32_armv8_hw(uint32_t c, const uint8_t *b, size_t l) {
++    return crc32_hw_ieee(c, b, l); // or your interleaved version
++}
++
++static uint32_t crc32_auto(uint32_t c, const uint8_t *b, size_t l) {
++    unsigned long caps = getauxval(AT_HWCAP);
++    if (caps & HWCAP_CRC32) {
++	    return crc32_armv8_hw(c, b, l);
++    } else {
++	    printf("SW CRC not enabled, please compile with"
++	           " -mcpu=cortex-a55+crc or -march=armv8-a+crypto+crc\n");
++	    return 0;
++    }
++}
++
+ // writes the crc for the buffer of size buffer_size with content of length content_size.
+ // essentially the crc is written into buffer at location content_size
+ // Per IB spec, content_size must include all headers unless we go outside of subnet
+@@ -167,15 +321,46 @@ static bool update_crc(uint8_t* buffer, size_t buffer_size, size_t content_size)
+         return false;
+     }
+     static uint8_t crc_init_buf[8] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
+-    uint32_t crc = crc32(crc32(0L, crc_init_buf, sizeof(crc_init_buf)), buffer, content_size);
++#ifdef CRC_UPDATE_DEFAULT
++     uint32_t crc = crc32(crc32(0L, crc_init_buf, sizeof(crc_init_buf)), buffer, content_size);
++#else
++     uint32_t crc = crc32_auto(crc32_auto(0L, crc_init_buf, sizeof(crc_init_buf)), buffer, content_size);
++#endif
+     // per zlib docs, crc is already in network byte order and application should not modify. direct copy.
+     memcpy(buffer + content_size, &crc, sizeof(uint32_t));
++
+     return true;
+ }
+ 
++uint32_t gcrc = 0;
++uint64_t gcrc_size = 0;
++#if 0
++static inline uint64_t
++latency_cycles(void (*fn)(uint32_t c, uint8_t *, size_t), uint32_t c,  uint8_t *arg, size_t arg1)
++{
++    const uint64_t t0 = rte_rdtsc();   // Start timestamp
++    fn(c, arg, arg1);                           // Execute target function
++    const uint64_t t1 = rte_rdtsc();   // End timestamp
++    return (t1 - t0);
++}
++
++static inline double cycles_to_ns(uint64_t cycles)
++{
++    const double hz = (double)rte_get_tsc_hz();
++    return (cycles * 1e9) / hz;
++}
++
++static inline double cycles_to_us(uint64_t cycles)
++{
++    const double hz = (double)rte_get_tsc_hz();
++    return (cycles * 1e6) / hz;
++}
++#endif
++
+ // assumes that the buffer size is large enough to hold the whole packet, else UB.
+ // if either of content or headers.ret_h.content_size are 0/nullptr, the payload will not be copied and it is up to the caller to ensure payload is written to buffer
+-static size_t serialize_packet(LinuxHeaders& headers, uint8_t* __restrict__ buffer, size_t buffer_size, const uint8_t* __restrict__ content)
++static size_t serialize_packet(LinuxHeaders& headers, uint8_t* __restrict__ buffer, size_t buffer_size, const uint8_t* __restrict__ content,
++				int meta)
+ {
+     // local copy of content_size.
+     // NOTE: headers.ret_h.content_size is the single source of truth for the content_size
+@@ -229,7 +414,30 @@ static size_t serialize_packet(LinuxHeaders& headers, uint8_t* __restrict__ buff
+         memcpy(buffer + IB_PAYLOAD_OFFSET, content, content_size);
+     }
+ 
+-    update_crc(buffer, buffer_size, crc_offset);
++#ifdef CRC_UPDATE_PER_LINE
++	update_crc(buffer, buffer_size , crc_offset);
++#endif //CRC_UPDATE_PER_LINE
++#ifdef GCRC_UPDATE
++	if (!meta) {
++		gcrc = crc32_auto(gcrc, buffer + IB_PAYLOAD_OFFSET, content_size);
++		gcrc_size += content_size;
++	}
++
++	/* Combine logic, if user want to combine line crc with previous, but its costly */
++#if 0
++	gcrc = crc32_combine_ieee(gcrc, crc, (uint64_t)content_size);
++#endif
++	/*CRC latency calculation code */
++#if 0
++	uint64_t cycles;
++	cycles= latency_cycles(crc32_auto, 0,  buffer + IB_PAYLOAD_OFFSET, content_size);
++	double us;
++	us  = cycles_to_us(cycles);
++
++	printf("  %lu cycles\n", cycles);
++	printf(" first  %.2f us\n", us);
++#endif
++#endif //CRC_UPDATE
+ 
+     // reset the serializer to the beginning of the buffer to write the actual IPHeader & UDPHeader
+     serializer = hololink::core::Serializer(buffer, buffer_size);
+@@ -247,16 +455,28 @@ static size_t serialize_packet(LinuxHeaders& headers, uint8_t* __restrict__ buff
+     return message_size;
+ }
+ 
++
++int64_t timespec_diff_ns(struct timespec t1, struct timespec t0) {
++    int64_t ns1 = (int64_t)t1.tv_sec * 1000000000LL + (int64_t)t1.tv_nsec;
++    int64_t ns0 = (int64_t)t0.tv_sec * 1000000000LL + (int64_t)t0.tv_nsec;
++    return ns1 - ns0; // nanoseconds
++}
++
+ // returns 0 on failure or the number of bytes written to buffer on success
+ static size_t write_frame_metadata(uint8_t* __restrict__ buffer, size_t buffer_size, const struct timespec& frame_start_timestamp, size_t n_bytes_sent, uint32_t frame_number, uint32_t psn, uint8_t page)
+ {
+     int32_t immediate_value = (page) | ((psn & IB_PSN_MASK) << 8);
+     struct timespec meta_timestamp;
+-    clock_gettime(FRAME_METADATA_CLOCK, &meta_timestamp);
++#ifdef PHC_CLOCK
++	clock_gettime(clkid, &meta_timestamp);
++#else
++	clock_gettime(FRAME_METADATA_CLOCK, &meta_timestamp);
++#endif
+     FrameMetadata frame_metadata = {
+         .flags = 0,
+         .psn = psn,
+-        .crc = 0,
++//        .crc = gcrc,
++        .crc = gcrc ^ 0xFFFFFFFF,
+         // Time when the first sample data for the frame was sent
+         .timestamp_s = (uint64_t)frame_start_timestamp.tv_sec,
+         .timestamp_ns = (uint32_t)frame_start_timestamp.tv_nsec,
+@@ -267,6 +487,10 @@ static size_t write_frame_metadata(uint8_t* __restrict__ buffer, size_t buffer_s
+         .metadata_ns = (uint32_t)meta_timestamp.tv_nsec,
+     };
+ 
++#if EXTRA_DEBUG
++   printf("psn = %d , frame number = %d, timestamp s = 0x%lx timestamp_ns = %u, meta_s = 0x%lx metas_ns = %u diff = %0.4f\n", psn, frame_number, (uint64_t)frame_metadata.timestamp_s, (uint32_t)frame_start_timestamp.tv_nsec, (uint64_t)meta_timestamp.tv_sec, (uint32_t)meta_timestamp.tv_nsec, (double)  timespec_diff_ns(meta_timestamp, frame_start_timestamp) / 1000000);
++#endif
++
+     hololink::core::Serializer serializer = hololink::core::Serializer(buffer, buffer_size);
+     serializer.append_uint32_be(immediate_value);
+     size_t frame_metadata_size = serialize_frame_metadata(serializer, frame_metadata);
+@@ -311,6 +535,7 @@ LinuxTransmitter::LinuxTransmitter(const LinuxHeaders& headers)
+     init_socket();
+ }
+ 
++
+ // Infiniband transmitter without using ib verbs apis
+ LinuxTransmitter::LinuxTransmitter(const IPAddress& source_ip)
+     : linux_headers_(DEFAULT_LINUX_HEADERS)
+@@ -319,11 +544,23 @@ LinuxTransmitter::LinuxTransmitter(const IPAddress& source_ip)
+     linux_headers_.ip_h.saddr = ntohl(source_ip.ip_address);
+     linux_headers_.udp_h.source = source_ip.port;
+ 
++#ifdef PHC_CLOCK
++    phc_fd = open(phc, O_RDONLY);
++    if (phc_fd < 0) {
++        perror("open /dev/ptp0");
++    }
++    clkid = FD_TO_CLOCKID(phc_fd);
++#endif
++
+     init_socket();
+ }
+ 
+ LinuxTransmitter::~LinuxTransmitter()
+ {
++#ifdef PHC_CLOCK
++	close(phc_fd);
++	phc_fd = -1;
++#endif
+     if (data_socket_fd_ >= 0) {
+         close(data_socket_fd_);
+     }
+@@ -332,6 +569,176 @@ LinuxTransmitter::~LinuxTransmitter()
+     double_buffer_size_ = 0;
+ }
+ 
++static struct rte_mbuf_ext_shared_info shinfo;
++struct timespec frame_start_timestamp;
++int64_t n_bytes_sent = 0;
++
++#ifdef ROCEv2
++	/* TBD */
++#else   // Non-RDMA HSB payload.
++
++int64_t LinuxTransmitter::send_dpdk(const TransmissionMetadata* metadata, const DLTensor& tensor,
++		struct rte_mempool *mbuf_pool, uint16_t portid, rte_mbuf_extbuf_free_callback_t  ext_buf_free_callback_fn,
++		uint16_t line_no, uint8_t is_last, phys_addr_t buf_paddr)
++{
++	struct rte_mbuf *mbuf;
++	int ret = 0;
++
++#if EXTRA_DEBUG
++	struct rte_eth_dev_info dev_info;
++	ret = rte_eth_dev_info_get(portid, &dev_info);
++	printf("Send DPDK port_id = %d is %s payload size = %d frame size = %d\n",
++			portid, dev_info.driver_name,  metadata->payload_size, metadata->frame_size);
++#endif
++	// buffer for packet data
++	uint8_t mesg[hololink::core::UDP_PACKET_SIZE];
++	// buffer for immediate value and frame metadata
++	LinuxTransmissionMetadata* linux_metadata = (LinuxTransmissionMetadata*)metadata;
++	// if no destination port or address, short circuit and return 0
++	if (!metadata->dest_port) {
++		return 0;
++	}
++	if (!metadata->dest_ip_address) {
++		return 0;
++	}
++	linux_headers_.ip_h.daddr = metadata->dest_ip_address;
++	linux_headers_.udp_h.dest = metadata->dest_port;
++	BTHeader* bt_header = (BTHeader*)&linux_headers_.bt_h;
++	bt_header->opcode = IB_OPCODE_WRITE; // overwrite in immediate packet
++	bt_header->qp = (0xFF << 24) | (linux_metadata->qp & 0xFFFFFF);
++	bt_header->psn = psn_; // overwrite in loop
++	RETHeader* ret_header = (RETHeader*)&linux_headers_.ret_h;
++	ret_header->vaddress = linux_metadata->address;
++	ret_header->rkey = linux_metadata->rkey;
++
++	int64_t n_bytes = DLTensor_n_bytes(tensor);
++	uint8_t* content = (uint8_t*)tensor.data;
++
++	if (line_no == 0) {
++		//gcrc = crc32(0L, Z_NULL, 0);
++	//	gcrc_size = 0;
++		n_bytes_sent = 0;
++//        psn_ = 0;  // Reset to 0 at start of frame
++#ifdef PHC_CLOCK
++		clock_gettime(clkid, &frame_start_timestamp);
++#else
++		clock_gettime(FRAME_METADATA_CLOCK, &frame_start_timestamp);
++#endif
++	}
++
++        // prepare headers for packet
++        bt_header->psn = psn_;
++        ret_header->content_size = n_bytes;
++	ret_header->vaddress = n_bytes * line_no;
++
++	mbuf = rte_pktmbuf_alloc(mbuf_pool);
++	if (!mbuf) {
++                fprintf(stderr, "rte_pktmbuf_alloc fails \n");
++	}
++	if (ext_buf_free_callback_fn == NULL) {
++                fprintf(stderr, "ext_buf_free_callback_fn is NULL \n");
++	} else {
++		shinfo.free_cb = ext_buf_free_callback_fn;
++		rte_pktmbuf_attach_extbuf(mbuf, content - (IP_HEADER_SIZE + UDP_HEADER_SIZE + IB_HEADER_SIZE + sizeof(struct rte_ether_hdr)),
++				buf_paddr - (IP_HEADER_SIZE + UDP_HEADER_SIZE + IB_HEADER_SIZE + sizeof(struct rte_ether_hdr)),
++				n_bytes, &shinfo);
++		struct rte_ether_hdr *eth_hdr = rte_pktmbuf_mtod(mbuf, struct rte_ether_hdr *);
++		ret = rte_eth_macaddr_get(portid, &eth_hdr->src_addr);
++		if (ret != 0)
++			fprintf(stderr, "Not able to get source MAC\n");
++		eth_hdr->dst_addr.addr_bytes[5] = static_cast<uint8_t>((metadata->dest_mac_low >> 0) & 0xFF);
++		eth_hdr->dst_addr.addr_bytes[4] = static_cast<uint8_t>((metadata->dest_mac_low >> 8) & 0xFF);
++		eth_hdr->dst_addr.addr_bytes[3] = static_cast<uint8_t>((metadata->dest_mac_low >> 16) & 0xFF);
++		eth_hdr->dst_addr.addr_bytes[2] = static_cast<uint8_t>((metadata->dest_mac_low >> 24) & 0xFF);
++		eth_hdr->dst_addr.addr_bytes[1] = static_cast<uint8_t>((metadata->dest_mac_high >> 0) & 0xFF);
++		eth_hdr->dst_addr.addr_bytes[0] = static_cast<uint8_t>((metadata->dest_mac_high >> 8) & 0xFF);
++
++		eth_hdr->ether_type = rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4);
++	        uint8_t *data = (uint8_t *)eth_hdr + sizeof(struct rte_ether_hdr);
++		size_t message_size = serialize_packet(linux_headers_, data,
++				mbuf->buf_len + (IP_HEADER_SIZE + UDP_HEADER_SIZE + IB_HEADER_SIZE + sizeof(struct rte_ether_hdr)),
++				NULL, 0);
++		if (message_size != IB_PAYLOAD_OFFSET + n_bytes + sizeof(uint32_t)) {
++			fprintf(stderr, "error in writing packet psn %d. found %zu expected %zu\n",
++				    psn_, message_size, IB_PAYLOAD_OFFSET + n_bytes + sizeof(uint32_t));
++		}
++
++		mbuf->l2_len = sizeof(struct rte_ether_hdr);
++		mbuf->l3_len = sizeof(struct rte_ipv4_hdr);
++		mbuf->l4_len = sizeof(struct rte_udp_hdr);
++
++		mbuf->ol_flags = RTE_MBUF_F_TX_IPV4 | RTE_MBUF_F_TX_IP_CKSUM | RTE_ETH_TX_OFFLOAD_IPV4_CKSUM | RTE_ETH_TX_OFFLOAD_UDP_CKSUM;
++		mbuf->data_len = mbuf->pkt_len = message_size + sizeof(struct rte_ether_hdr);
++
++	}
++
++	ret = rte_eth_tx_burst(portid, 0, &mbuf, 1);
++	if (ret <= 0) {
++            fprintf(stderr, "packet not sent ret= %d port id = %d\n", ret, portid);
++            rte_pktmbuf_free(mbuf);
++        } else {
++            n_bytes_sent += n_bytes;
++        }
++        psn_ = (psn_ + 1) & IB_PSN_MASK;
++
++	if (!is_last)
++		return n_bytes;
++
++	mbuf = rte_pktmbuf_alloc(mbuf_pool);
++	if (!mbuf) {
++		fprintf(stderr, "rte_pktmbuf_alloc fails\n");
++	}
++	struct rte_ether_hdr *eth_hdr = rte_pktmbuf_mtod(mbuf, struct rte_ether_hdr *);
++	uint8_t *data = (uint8_t *)eth_hdr + sizeof(struct rte_ether_hdr);
++
++	size_t n_bytes_to_send = write_frame_metadata((data + IB_PAYLOAD_OFFSET), sizeof(uint32_t) + FRAME_METADATA_SIZE,
++		frame_start_timestamp, n_bytes_sent, frame_number_, psn_, linux_metadata->page);
++
++	// prep headers for immediate packet
++	bt_header->opcode = IB_OPCODE_WRITE_IMMEDIATE;
++	bt_header->psn = psn_;
++	ret_header->content_size = n_bytes_to_send;
++	ret_header->vaddress = linux_metadata->address + linux_metadata->metadata_offset;
++
++	if (!n_bytes_to_send) {
++		fprintf(stderr, "could not write frame metadata\n");
++	}
++
++	ret = rte_eth_macaddr_get(portid, &eth_hdr->src_addr);
++	if (ret != 0)
++		fprintf(stderr, "Not able to get source MAC\n");
++	eth_hdr->dst_addr.addr_bytes[5] = static_cast<uint8_t>((metadata->dest_mac_low >> 0) & 0xFF);
++	eth_hdr->dst_addr.addr_bytes[4] = static_cast<uint8_t>((metadata->dest_mac_low >> 8) & 0xFF);
++	eth_hdr->dst_addr.addr_bytes[3] = static_cast<uint8_t>((metadata->dest_mac_low >> 16) & 0xFF);
++	eth_hdr->dst_addr.addr_bytes[2] = static_cast<uint8_t>((metadata->dest_mac_low >> 24) & 0xFF);
++	eth_hdr->dst_addr.addr_bytes[1] = static_cast<uint8_t>((metadata->dest_mac_high >> 0) & 0xFF);
++	eth_hdr->dst_addr.addr_bytes[0] = static_cast<uint8_t>((metadata->dest_mac_high >> 8) & 0xFF);
++	eth_hdr->ether_type = rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4);
++	size_t message_size = serialize_packet(linux_headers_, data, mbuf->buf_len - sizeof(struct rte_ether_hdr), NULL, 1);
++
++	mbuf->pkt_len = message_size + sizeof(struct rte_ether_hdr);
++	mbuf->data_len = message_size + sizeof(struct rte_ether_hdr);
++
++	mbuf->l2_len = sizeof(struct rte_ether_hdr);
++	mbuf->l3_len = sizeof(struct rte_ipv4_hdr);
++	mbuf->l4_len = sizeof(struct rte_udp_hdr);
++
++	mbuf->ol_flags = RTE_MBUF_F_TX_IPV4 | RTE_MBUF_F_TX_IP_CKSUM | RTE_ETH_TX_OFFLOAD_IPV4_CKSUM | RTE_ETH_TX_OFFLOAD_UDP_CKSUM;
++	ret = rte_eth_tx_burst(portid, 0, &mbuf, 1);
++	if (ret <= 0) {
++		fprintf(stderr, "Meta packet not sent ret= %d port id = %d\n", ret, portid);
++		rte_pktmbuf_free(mbuf);
++	} else {
++		n_bytes_sent += n_bytes_to_send;
++	}
++end:
++	// update LinuxTransmitter state and return number of bytes successfully sent
++	psn_ = (psn_ + 1) & IB_PSN_MASK;
++	frame_number_++;
++	return n_bytes + n_bytes_to_send;
++}
++#endif // ROCEv2
++
+ // returns -1 on failure or the number of bytes successfully sent, which may be 0.
+ int64_t LinuxTransmitter::send(const TransmissionMetadata* metadata, const DLTensor& tensor)
+ {
+@@ -346,7 +753,6 @@ int64_t LinuxTransmitter::send(const TransmissionMetadata* metadata, const DLTen
+     if (!metadata->dest_ip_address) {
+         return 0;
+     }
+-
+     // copy metadata to linux_headers_ and local data
+     const uint16_t udp_payload_size = metadata->payload_size;
+     linux_headers_.ip_h.daddr = metadata->dest_ip_address;
+@@ -380,12 +786,15 @@ int64_t LinuxTransmitter::send(const TransmissionMetadata* metadata, const DLTen
+     // set the copy function to be used based on content's device location
+     switch (tensor.device.device_type) {
+     case kDLCPU:
++#if USE_CUDA
+     case kDLCUDAHost:
++#endif
+         break;
+     // For managed memory, assume it is on GPU and use double buffering.
+     // TODO: add support for using cudaMemcpyDefault determined at initialization time for managed
+     //   memory as possible improvement (doesn't appear to guarantee performance improvement).
+     //   Need to ensure Unified Addressing is enabled on device.
++#if USE_CUDA
+     case kDLCUDAManaged:
+     case kDLCUDA: {
+         if (double_buffer_size_ < n_bytes) {
+@@ -405,6 +814,7 @@ int64_t LinuxTransmitter::send(const TransmissionMetadata* metadata, const DLTen
+         content = (uint8_t*)double_buffer_;
+         break;
+     }
++#endif
+     default:
+         fprintf(stderr, "Unsupported device memory type: %d\n", (int)tensor.device.device_type);
+         return -1;
+@@ -420,7 +830,7 @@ int64_t LinuxTransmitter::send(const TransmissionMetadata* metadata, const DLTen
+         ret_header->content_size = n_bytes_to_send;
+         ret_header->vaddress = linux_metadata->address + offset;
+ 
+-        size_t message_size = serialize_packet(linux_headers_, mesg, sizeof(mesg), content + offset);
++        size_t message_size = serialize_packet(linux_headers_, mesg, sizeof(mesg), content + offset, 0);
+         if (message_size != IB_PAYLOAD_OFFSET + n_bytes_to_send + sizeof(uint32_t)) {
+             fprintf(stderr, "error in writing packet psn %d. found %zu expected %zu\n", psn_, message_size, IB_PAYLOAD_OFFSET + n_bytes_to_send + sizeof(uint32_t));
+         } else if (sendto(data_socket_fd_, &mesg, message_size, 0, (struct sockaddr*)&dest_addr, sizeof(dest_addr)) <= 0) {
+@@ -448,7 +858,7 @@ int64_t LinuxTransmitter::send(const TransmissionMetadata* metadata, const DLTen
+     }
+ 
+     // pass nullptr content and copy function since metadata is already written to the mesg packet buffer
+-    size_t message_size = serialize_packet(linux_headers_, mesg, sizeof(mesg), nullptr);
++    size_t message_size = serialize_packet(linux_headers_, mesg, sizeof(mesg), nullptr, 1);
+     // 2 * sizeof(uin32_t) to account for immediate value and crc
+     if (message_size != IB_PAYLOAD_OFFSET + n_bytes_to_send + sizeof(uint32_t)) {
+         fprintf(stderr, "error in serialize immediate packet. found %zu expected %zu\n", message_size, IB_PAYLOAD_OFFSET + n_bytes_to_send + sizeof(uint32_t));
+diff --git a/src/hololink/emulation/linux_transmitter.hpp b/src/hololink/emulation/linux_transmitter.hpp
+index 3ab25c0..a4e50f0 100644
+--- a/src/hololink/emulation/linux_transmitter.hpp
++++ b/src/hololink/emulation/linux_transmitter.hpp
+@@ -1,6 +1,7 @@
+ /**
+  * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+  * SPDX-License-Identifier: Apache-2.0
++ * Copyright 2026 NXP
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -23,6 +24,8 @@
+ #include <cstdint>
+ #include <cstring>
+ 
++#include <rte_mbuf.h>
++
+ #include "dlpack/dlpack.h"
+ 
+ #include "base_transmitter.hpp"
+@@ -104,6 +107,9 @@ public:
+      * @return The number of bytes sent or < 0 on error
+      */
+     int64_t send(const TransmissionMetadata* metadata, const DLTensor& tensor) override;
++    int64_t send_dpdk(const TransmissionMetadata* metadata, const DLTensor& tensor,
++		    struct rte_mempool *mbuf_pool, uint16_t portid, rte_mbuf_extbuf_free_callback_t  ext_buf_free_callback_fn,
++		    uint16_t line_no, uint8_t is_last, phys_addr_t buf_paddr) override;
+ 
+ private:
+     void init_socket();
+diff --git a/src/hololink/emulation/mem_register.cpp b/src/hololink/emulation/mem_register.cpp
+index 1d52bb3..3c10cba 100644
+--- a/src/hololink/emulation/mem_register.cpp
++++ b/src/hololink/emulation/mem_register.cpp
+@@ -1,6 +1,7 @@
+ /**
+  * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+  * SPDX-License-Identifier: Apache-2.0
++ * Copyright 2026 NXP
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -122,4 +123,4 @@ std::vector<uint32_t> MemRegister::read_range(uint32_t start_address, uint32_t n
+     return values;
+ }
+ 
+-} // namespace hololink::emulation
+\ No newline at end of file
++} // namespace hololink::emulation
+diff --git a/src/hololink/emulation/sensors/CMakeLists.txt b/src/hololink/emulation/sensors/CMakeLists.txt
+index e0c8e11..04dc645 100644
+--- a/src/hololink/emulation/sensors/CMakeLists.txt
++++ b/src/hololink/emulation/sensors/CMakeLists.txt
+@@ -1,5 +1,6 @@
+ # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ # SPDX-License-Identifier: Apache-2.0
++# Copyright 2026 NXP
+ #
+ # Licensed under the Apache License, Version 2.0 (the "License");
+ # you may not use this file except in compliance with the License.
+@@ -21,7 +22,14 @@ set_property(TARGET emulation_sensors PROPERTY POSITION_INDEPENDENT_CODE ON)
+ 
+ add_library(hololink::emulation::sensors ALIAS emulation_sensors)
+ 
+-find_package(CUDAToolkit REQUIRED)
++set(USE_CUDA OFF)
++if (CUDAToolkit_FOUND AND NOT HOLOLINK_BUILD_ONLY_NATIVE)
++  set(USE_CUDA ON)
++endif()
++
++if (USE_CUDA)
++  find_package(CUDAToolkit REQUIRED)
++endif()
+ 
+ target_include_directories(emulation_sensors
+   PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../../../
+-- 
+2.43.0
+

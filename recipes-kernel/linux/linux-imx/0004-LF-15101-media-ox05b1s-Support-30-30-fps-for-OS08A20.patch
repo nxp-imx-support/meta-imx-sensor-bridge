@@ -1,0 +1,94 @@
+From dbcc2e66eb0278d974b4e42b4caa21d101da3162 Mon Sep 17 00:00:00 2001
+From: Sachin Saxena <sachin.saxena@nxp.com>
+Date: Thu, 19 Mar 2026 08:41:58 +0530
+Subject: [PATCH 4/4] LF-15101: media: ox05b1s: Support 30+30 fps for OS08A20
+ in 4k-10bit HDR mode
+
+ Switch to 60fps for 4k BGGR10 non-HDR mode, in order to support
+ 30fps + 30fps in HDR mode.
+
+Signed-off-by: Mirela Rabulea <mirela.rabulea@oss.nxp.com>
+Signed-off-by: Gagandeep Singh <g.singh@nxp.com>
+Signed-off-by: Sachin Saxena <sachin.saxena@nxp.com>
+Upstream-Status: Pending
+---
+ drivers/media/i2c/ox05b1s/ox05b1s_mipi.c  | 8 ++++----
+ drivers/media/i2c/ox05b1s/ox05b1s_modes.c | 8 +++++---
+ 2 files changed, 9 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/media/i2c/ox05b1s/ox05b1s_mipi.c b/drivers/media/i2c/ox05b1s/ox05b1s_mipi.c
+index dd6d91d75abe..33d9911c5705 100644
+--- a/drivers/media/i2c/ox05b1s/ox05b1s_mipi.c
++++ b/drivers/media/i2c/ox05b1s/ox05b1s_mipi.c
+@@ -2,7 +2,7 @@
+ /*
+  * A V4L2 driver for Omnivision OX05B1S RGB-IR camera.
+  *
+- * Copyright 2024-2025 NXP
++ * Copyright 2024-2026 NXP
+  *
+  * Inspired from Sony imx219, imx290, imx214 and imx334 camera drivers
+  *
+@@ -161,14 +161,14 @@ static const struct ox05b1s_mode os08a20_supported_modes[] = {
+ 		.reg_data	= os08a20_reglist_1080p_10b,
+ 	},
+ 	{
+-		/* 4k BGGR10, no hdr, 30fps */
++		/*  4k BGGR10, staggered hdr VC0/VC1, 30 + 30 fps */
+ 		.index		= 1,
+ 		.width		= 3840,
+ 		.height		= 2160,
+ 		.code		= MEDIA_BUS_FMT_SBGGR10_1X10,
+ 		.bpp		= 10,
+ 		.vts		= 0x90a,
+-		.hts		= 0x818,
++		.hts		= 0x40c,
+ 		.exp		= 0x90a - 8,
+ 		.h_bin		= false,
+ 		.pixel_rate	= OS08A20_PIXEL_RATE_288M,
+@@ -793,7 +793,7 @@ static const struct v4l2_ctrl_ops ox05b1s_ctrl_ops = {
+  * link_freq = (pixel_rate * bpp) / (2 * data_lanes)
+  */
+ static const s64 ox05b1s_csi2_link_freqs[] = {
+-	200000000,
++	400000000,
+ };
+ 
+ /* Link freq for default mode: 1080p RAW10, 4 data lanes 800 Mbps/lane. */
+diff --git a/drivers/media/i2c/ox05b1s/ox05b1s_modes.c b/drivers/media/i2c/ox05b1s/ox05b1s_modes.c
+index cc5d0bf7315e..751c830b2557 100644
+--- a/drivers/media/i2c/ox05b1s/ox05b1s_modes.c
++++ b/drivers/media/i2c/ox05b1s/ox05b1s_modes.c
+@@ -1,7 +1,7 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ /*
+  * Register configurations for all sensor supported modes
+- * Copyright 2024-2025, NXP
++ * Copyright 2024-2026 NXP
+  * Copyright 2024, Omnivision
+  * Copyright 2024, Verisilicon
+  *
+@@ -13,6 +13,7 @@
+ #define OS08A20_REG_PLL_CTRL_05		CCI_REG8(0x0305)
+ #define OS08A20_REG_PLL_CTRL_25		CCI_REG8(0x0325)
+ #define OS08A20_REG_MIPI_BIT_10_12	CCI_REG8(0x031e)
++#define OS08A20_REG_EXP_LONG		CCI_REG16(0x3501)
+ /* Analog Control Registers 0x3600-0x3637 */
+ #define OS08A20_REG_ANA_CTRL		CCI_REG8(0x3600)
+ #define OS08A20_REG_CORE_0		CCI_REG8(0x3660)
+@@ -63,9 +64,10 @@ static const struct cci_reg_sequence os08a20_init_setting_12bit[] = {
+ 
+ /* OS08A20 3840 x 2160 @30fps BGGR10 */
+ static const struct cci_reg_sequence os08a20_init_setting_4k_10b[] = {
+-	{OS08A20_REG_PLL_CTRL_05, 0x3c},
++	{OS08A20_REG_PLL_CTRL_05, 0x5a},
+ 	{OS08A20_REG_FORMAT2, 0x04}, /* mirror */
+-	{OS08A20_REG_PCLK_PERIOD, 0x10},
++	{OS08A20_REG_PCLK_PERIOD, 0x0b},
++	{OS08A20_REG_EXP_LONG, 0x07e1}, /* long exposure */
+ };
+ 
+ /* OS08A20 3840 x 2160 @30fps BGGR12 */
+-- 
+2.43.0
+

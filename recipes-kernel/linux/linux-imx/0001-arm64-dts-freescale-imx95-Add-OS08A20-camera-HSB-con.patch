@@ -1,0 +1,75 @@
+From bd51384ab5afb04094fe98e342c3a5f4a39bbedd Mon Sep 17 00:00:00 2001
+From: Sachin Saxena <sachin.saxena@nxp.com>
+Date: Mon, 16 Mar 2026 13:06:45 +0530
+Subject: [PATCH 1/4] arm64: dts: freescale: imx95: Add OS08A20 camera HSB
+ config
+
+ Add device tree blob configuration for i.MX95 19x19 EVK with OS08A20
+ camera sensor and ADV7535 HDMI bridge support. This configuration is
+ intended for Hardware Sensor Board (HSB) testing and validation.
+
+ The overlay combination includes:
+  - imx95-19x19-evk-os08a20.dtbo: OS08A20 camera sensor configuration
+  - imx95-19x19-evk-hsb.dtbo: ISI alias configuration
+
+Signed-off-by: Sachin Saxena <sachin.saxena@nxp.com>
+Upstream-Status: Pending
+---
+ arch/arm64/boot/dts/freescale/Makefile        |  6 +++++
+ .../dts/freescale/imx95-19x19-evk-hsb.dtso    | 27 +++++++++++++++++++
+ 2 files changed, 33 insertions(+)
+ create mode 100644 arch/arm64/boot/dts/freescale/imx95-19x19-evk-hsb.dtso
+
+diff --git a/arch/arm64/boot/dts/freescale/Makefile b/arch/arm64/boot/dts/freescale/Makefile
+index 0bf63f8fff03..4e1461638428 100644
+--- a/arch/arm64/boot/dts/freescale/Makefile
++++ b/arch/arm64/boot/dts/freescale/Makefile
+@@ -719,6 +719,12 @@ dtb-$(CONFIG_ARCH_MXC) += imx95-19x19-evk-netc-rpmsg.dtb
+ imx95-19x19-evk-os08a20-dtbs := imx95-19x19-evk.dtb imx95-19x19-evk-os08a20.dtbo
+ dtb-$(CONFIG_ARCH_MXC) += imx95-19x19-evk-os08a20.dtb
+ 
++imx95-19x19-evk-os08a20-hsb-dtbs := imx95-19x19-evk.dtb \
++                                    imx95-19x19-evk-os08a20.dtbo \
++                                    imx95-19x19-evk-hsb.dtbo \
++                                    imx95-19x19-evk-adv7535.dtbo
++dtb-$(CONFIG_ARCH_MXC) += imx95-19x19-evk-os08a20-hsb.dtb
++
+ imx95-19x19-evk-ox05b1s-dtbs := imx95-19x19-evk.dtb imx95-19x19-evk-ox05b1s.dtbo
+ dtb-$(CONFIG_ARCH_MXC) += imx95-19x19-evk-ox05b1s.dtb
+ 
+diff --git a/arch/arm64/boot/dts/freescale/imx95-19x19-evk-hsb.dtso b/arch/arm64/boot/dts/freescale/imx95-19x19-evk-hsb.dtso
+new file mode 100644
+index 000000000000..19863776fe8a
+--- /dev/null
++++ b/arch/arm64/boot/dts/freescale/imx95-19x19-evk-hsb.dtso
+@@ -0,0 +1,27 @@
++// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
++/*
++ * Copyright 2026 NXP
++ *
++ * HSB overlay for i.MX95 19x19 EVK
++ */
++
++/dts-v1/;
++/plugin/;
++
++/ {
++	fragment@0 {
++		target-path = "/";
++		__overlay__ {
++			aliases {
++				isi0 = "/soc/isi@4ad50000";
++			};
++		};
++	};
++
++	fragment@1 {
++		target-path = "/soc/isi@4ad50000";
++		__overlay__ {
++			status = "okay";
++		};
++	};
++};
+-- 
+2.43.0
+

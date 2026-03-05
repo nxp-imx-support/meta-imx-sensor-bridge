@@ -1,0 +1,17 @@
+#!/bin/bash -e
+# SPDX-License-Identifier: MIT
+# Copyright 2026 NXP
+
+MACHINE=${MACHINE:-imx95-19x19-lpddr5-evk}
+DISTRO=${DISTRO:-fsl-imx-xwayland}
+EULA=1
+T="../sources/meta-imx-sensor-bridge/bbfile"
+
+. imx-setup-release.sh $@
+
+for _d in ${T}/*;do
+	_file=$(basename ${_d})
+	for _f in ${_d}/*;do
+		cat ${_f} >> conf/${_file}
+	done;
+done
